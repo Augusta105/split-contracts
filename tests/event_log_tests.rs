@@ -264,6 +264,138 @@ fn test_event_log_with_multiple_recipients() {
 }
 
 #[test]
+fn test_guard_failure_events_emitted_per_guard() {
+    use split_contracts::contract::Client as SplitContractClient;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let contract_id = env.register_contract_wasm(None, split_contracts::WASM);
+    let client = SplitContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999);
+
+    // Partial payment leaves the invoice unfunded, so release must be blocked
+    // by the funding guard and emit a guard-failure event.
+    client.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false, &None);
+
+    let events_before = env.events().all().len();
+    let result = client.try_release(&invoice_id);
+    assert!(result.is_err(), "release should be blocked by guard");
+
+    let events = env.events().all();
+    assert!(
+        events.len() > events_before,
+        "guard failure should emit an event"
+    );
+
+    // Locate the guard-failure event and verify topics + payload.
+    let mut found = false;
+    for event in events.iter() {
+        let (topics, data): (Vec<Symbol>, Map<Symbol, soroban_sdk::Val>) = event.parsed_data();
+        if topics.len() == 3
+            && topics.get(0) == Some(Symbol::new(&env, "split"))
+            && topics.get(1) == Some(Symbol::new(&env, "guard_fail"))
+        {
+            found = true;
+            // Third topic identifies the specific guard.
+            let guard_topic = topics.get(2).expect("guard topic should exist");
+            assert!(
+                guard_topic == Symbol::new(&env, "guard")
+                    || guard_topic == Symbol::new(&env, "funding")
+                    || guard_topic == Symbol::new(&env, "deadline")
+                    || guard_topic == Symbol::new(&env, "status"),
+                "guard topic should identify the guard"
+            );
+            // Payload must carry guard data.
+            assert!(
+                data.contains_key(Symbol::new(&env, "guard"))
+                    || data.contains_key(Symbol::new(&env, "reason")),
+                "guard failure payload should include guard data"
+            );
+        }
+    }
+    assert!(found, "expected a guard_fail event to be emitted");
+}
+
+#[test]
+fn test_guard_failure_events_are_indexable() {
+    use split_contracts::contract::Client as SplitContractClient;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let contract_id = env.register_contract_wasm(None, split_contracts::WASM);
+    let client = SplitContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999);
+    client.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false, &None);
+
+    let _ = client.try_release(&invoice_id);
+
+    // Guard-failure events must be indexable by their topic symbols so that
+    // off-chain indexers can filter on (split, guard_fail, <guard>).
+    let events = env.events().all();
+    let split_topic = Symbol::new(&env, "split");
+    let guard_fail_topic = Symbol::new(&env, "guard_fail");
+
+    let mut indexed = 0;
+    for event in events.iter() {
+        let (topics, _data): (Vec<Symbol>, soroban_sdk::Val) = event.parsed_data();
+        if topics.get(0) == Some(split_topic.clone())
+            && topics.get(1) == Some(guard_fail_topic.clone())
+        {
+            indexed += 1;
+            assert!(
+                topics.get(2).is_some(),
+                "guard_fail event should carry a guard topic for indexing"
+            );
+        }
+    }
+    assert!(indexed >= 1, "at least one indexable guard_fail event expected");
+}
+
+#[test]
 fn fee_paid_event_carries_amount_and_treasury() {
     let env = Env::default();
     env.mock_all_auths();

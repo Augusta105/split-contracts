@@ -145,4 +145,11 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #957: A release guard prevented the operation. The specific guard
+    /// is identified in the emitted guard-failure event.
+    ReleaseGuardFailed = 67,
+    /// Issue #948: An incremental state update was rejected because the
+    /// supplied delta is inconsistent with the stored state (e.g. stale
+    /// version, out-of-order sequence, or mismatched base value).
+    IncrementalUpdateInvalid = 68,
 }

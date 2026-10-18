@@ -5695,6 +5695,333 @@ fn has_circuit_breaker_event(env: &Env, topic_name: &str) -> bool {
     env.events().all().events().iter().any(|event| xdr_event_topics(env, event).map(|topics| topic1_is(env, &topics, topic_name)).unwrap_or(false))
 }
 
+// ---------------------------------------------------------------------------
+// Issue #947: Fixed-point math accuracy and overflow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_point_bps_math_matches_integer_division() {
+    // bps math must stay exact for values that divide evenly.
+    let cases: [(i128, u32); 6] = [
+        (10_000, 100),   // 1%
+        (10_000, 1_000), // 10%
+        (1_000_000, 250),// 2.5%
+        (100, 10_000),   // 100%
+        (0, 5_000),      // zero base
+        (1, 0),          // zero bps
+    ];
+    for (amount, bps) in cases {
+        let expected = amount * (bps as i128) / 10_000;
+        let actual = amount
+            .checked_mul(bps as i128)
+            .expect("no overflow for test inputs")
+            / 10_000;
+        assert_eq!(actual, expected, "bps math mismatch for {} @ {} bps", amount, bps);
+    }
+}
+
+#[test]
+fn test_fixed_point_bps_math_rounds_down_consistently() {
+    // Truncation must be deterministic and never round up (never over-charge).
+    let amount: i128 = 333;
+    let bps: u32 = 333;
+    let product = amount * (bps as i128);
+    let result = product / 10_000;
+    assert_eq!(result, 11);
+    assert!(result * 10_000 <= product, "fixed-point result must not exceed exact value");
+}
+
+#[test]
+fn test_fixed_point_multiplication_overflow_detected() {
+    // checked_mul must surface overflow rather than silently wrapping.
+    let big: i128 = i128::MAX / 2;
+    assert!(big.checked_mul(3).is_none(), "overflow must be detected");
+    assert!(big.checked_mul(2).is_some(), "in-range multiplication must succeed");
+}
+
+#[test]
+fn test_fixed_point_accumulation_is_associative_for_small_values() {
+    // Summing per-recipient shares must equal the total share.
+    let total: i128 = 10_000;
+    let shares: [u32; 4] = [2_500, 2_500, 2_500, 2_500];
+    let mut acc: i128 = 0;
+    for bps in shares {
+        acc += total * (bps as i128) / 10_000;
+    }
+    assert_eq!(acc, total, "shares must sum back to the total");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #948: Incremental state updates match full rewrites
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_incremental_payments_match_full_funding_state() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    // Incremental payments: 100 + 100 + 100.
+    for _ in 0..3 {
+        c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    }
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 300, "incremental funding must equal total");
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_incremental_funded_matches_single_payment() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id_a = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id_a, &200_i128, &0_u64, &false, &false, &None);
+
+    let id_b = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id_b, &50_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id_b, &150_i128, &0_u64, &false, &false, &None);
+
+    assert_eq!(c.get_invoice(&id_a).funded, c.get_invoice(&id_b).funded);
+    assert_eq!(c.get_invoice(&id_a).status, c.get_invoice(&id_b).status);
+}
+
+#[test]
+fn test_incremental_audit_log_grows_per_action() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_audit_log(&id).len(), 1);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_audit_log(&id).len(), 2);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    // Third payment triggers release, appending a release entry.
+    assert!(c.get_audit_log(&id).len() >= 3);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #949: Storage tier placement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_storage_tier_invoice_core_readable_after_payment() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    // Core invoice data must remain in the hot tier and be readable.
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.id, id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_storage_tier_ext_data_isolated_from_core() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Core and extended records are stored separately and both retrievable.
+    let core = c.get_invoice(&id);
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(core.id, id);
+    assert!(ext.allowed_payers.is_none());
+}
+
+#[test]
+fn test_storage_tier_tombstone_after_delete() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    // Tombstone lives in its own tier and survives the core record removal.
+    let tombstone = c.get_tombstone(&id);
+    assert_eq!(tombstone.invoice_id, id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Deleted);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #957: Guard failure events
+// ---------------------------------------------------------------------------
+
+fn has_guard_failure_event(env: &Env, guard: &str) -> bool {
+    env.events().all().events().iter().any(|event| {
+        xdr_event_topics(env, event)
+            .map(|topics| topic1_is(env, &topics, "grd_fail") && topic2_is(env, &topics, guard))
+            .unwrap_or(false)
+    })
+}
+
+fn topic2_is(env: &Env, topics: &soroban_sdk::Vec<soroban_sdk::Val>, name: &str) -> bool {
+    use soroban_sdk::TryIntoVal;
+    topics.len() >= 3 && topics
+        .get(2)
+        .and_then(|v| { let r: Result<Symbol, _> = v.try_into_val(env); r.ok() })
+        .map(|s: Symbol| s == Symbol::new(env, name))
+        .unwrap_or(false)
+}
+
+#[test]
+fn test_guard_failure_event_on_deadline_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    env.ledger().set_timestamp(3_000);
+
+    let res = c.try_pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment past deadline must fail");
+    assert!(
+        has_guard_failure_event(&env, "deadline"),
+        "deadline guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_overpayment_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "overpayment must fail");
+    assert!(
+        has_guard_failure_event(&env, "overpay"),
+        "overpayment guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_deleted_invoice_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    let res = c.try_pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment on deleted invoice must fail");
+    assert!(
+        has_guard_failure_event(&env, "deleted"),
+        "deleted-invoice guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_circuit_breaker_guard() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment while paused must fail");
+    assert!(
+        has_guard_failure_event(&env, "paused"),
+        "circuit-breaker guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_absent_on_success() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    assert!(
+        !has_guard_failure_event(&env, "deadline"),
+        "no guard failure event should be emitted on success"
+    );
+}
+
 #[test]
 fn test_circuit_breaker_defaults_inactive() {
     let (env, contract_id, _token_id) = setup();

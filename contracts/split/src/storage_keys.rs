@@ -17,6 +17,22 @@
 //! | `AddressKey`  | persistent | `(address: Address)` singletons | ≤50      |
 //! | `CompoundKey` | persistent | two or three fields             | ≤50      |
 //!
+//! ## Tier placement policy (issues #948, #949)
+//! Keys are placed by access pattern, not by convenience:
+//!
+//! - **Instance** — small, hot, contract-wide config and counters that are
+//!   read on nearly every invocation (admin, pause flags, fees, token
+//!   addresses, aggregate stats). Instance storage is loaded once per
+//!   invocation, so keeping the payment-path config here avoids repeated
+//!   persistent reads.
+//! - **Persistent** — per-invoice and per-address state that must survive
+//!   archival and is only touched for the entities involved in a call.
+//!   Incremental updates (issue #948) write only the per-field keys that
+//!   actually changed instead of rewriting a whole invoice entry.
+//! - **Temporary** — ephemeral, per-transaction or short-lived counters
+//!   (reentrancy guard, event sequence numbers, rate-limit windows) that
+//!   can be discarded without affecting durable state.
+//!
 //! ## Collision safety
 //! Within each enum, Rust/XDR guarantees that every variant name is unique,
 //! so no two variants can produce the same serialised value. Cross-enum
@@ -165,6 +181,14 @@ pub enum StorageKey {
     ReentrancyGuard,
     /// Issue #526: Minimum number of recipients required per invoice.
     MinRecipients,
+
+    // --- Incremental update bookkeeping (issue #948) ---
+    /// Monotonic counter bumped on every incremental invoice-state write.
+    /// Lets readers detect stale cached views without re-reading the entry.
+    StateVersion,
+    /// Bitmask of per-field dirty flags for the most recent incremental
+    /// update, so a single flush can batch only the changed fields.
+    DirtyFieldMask,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +240,22 @@ pub enum InvoiceKey {
     /// Per-invoice event sequence counter — typed replacement for the former
     /// `(symbol_short!("ev_seq"), invoice_id)` inline key (issue #708).
     EvSeq(u64),
+
+    // --- Incremental per-field state (issue #948) ---
+    /// Per-invoice funded amount, written independently of the full entry.
+    FundedAmount(u64),
+    /// Per-invoice released amount, written independently of the full entry.
+    ReleasedAmount(u64),
+    /// Per-invoice refunded amount, written independently of the full entry.
+    RefundedAmount(u64),
+    /// Per-invoice status discriminant, written independently of the entry.
+    StatusField(u64),
+    /// Per-invoice recipient count, updated incrementally as payouts land.
+    RecipientCount(u64),
+    /// Per-invoice paid-recipient count, updated incrementally.
+    PaidCount(u64),
+    /// Per-invoice last-modified ledger, used to order incremental flushes.
+    LastModifiedLedger(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +291,10 @@ pub enum AddressKey {
     CreatorVolMile(Address),
     /// Issue #527: Payment history for a contributor address.
     PayerHistory(Address),
+    /// Issue #948: Per-address running total, updated incrementally.
+    AddressTotal(Address),
+    /// Issue #948: Per-address last-activity ledger for incremental flushes.
+    AddressLastActive(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +319,10 @@ pub enum CompoundKey {
     Template(Address, Symbol),
     TemplateVersion(Address, Symbol, u32),
     TemplateVersionCount(Address, Symbol),
+    /// Issue #948: Per-(invoice, recipient) incremental payout flag so a
+    /// single recipient can be marked paid without rewriting the whole
+    /// `PaidFlags` vector.
+    RecipientPaid(u64, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +412,8 @@ mod tests {
             StorageKey::PlatformVolThresh, StorageKey::PlatformVolMile,
             StorageKey::CreatorVolThresh, StorageKey::UpgradeProposal,
             StorageKey::ProtocolFee, StorageKey::ReentrancyGuard,
-            StorageKey::MinRecipients,
+            StorageKey::MinRecipients, StorageKey::StateVersion,
+            StorageKey::DirtyFieldMask,
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -389,7 +438,10 @@ mod tests {
             InvoiceKey::RecipientsList(id), InvoiceKey::AmountsList(id),
             InvoiceKey::PaidFlags(id), InvoiceKey::MilestoneFlags(id),
             InvoiceKey::ArchiveMarker(id), InvoiceKey::CreatedLedger(id),
-            InvoiceKey::EvSeq(id),
+            InvoiceKey::EvSeq(id), InvoiceKey::FundedAmount(id),
+            InvoiceKey::ReleasedAmount(id), InvoiceKey::RefundedAmount(id),
+            InvoiceKey::StatusField(id), InvoiceKey::RecipientCount(id),
+            InvoiceKey::PaidCount(id), InvoiceKey::LastModifiedLedger(id),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -434,6 +486,8 @@ mod tests {
             AddressKey::GlobalVelocity(addr.clone()),
             AddressKey::PauseExempt(addr.clone()),
             AddressKey::PayerHistory(addr.clone()),
+            AddressKey::AddressTotal(addr.clone()),
+            AddressKey::AddressLastActive(addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -462,6 +516,7 @@ mod tests {
             CompoundKey::ConfidentialPay(id, addr.clone()),
             CompoundKey::Delegation(id, addr.clone()),
             CompoundKey::PayerCooldown(id, addr.clone()),
+            CompoundKey::RecipientPaid(id, addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -524,5 +579,79 @@ pub fn tombstone_key(invoice_id: u64) -> (Symbol, u64) {
 /// old inline `(symbol_short!("ev_seq"), invoice_id)` tuple.
 pub fn ev_seq_key(invoice_id: u64) -> InvoiceKey {
     InvoiceKey::EvSeq(invoice_id)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #948: Incremental state update keys
+// ---------------------------------------------------------------------------
+
+/// Per-invoice funded amount — persistent storage.
+///
+/// Written on its own when funding changes, so the full invoice entry does
+/// not need to be rewritten (issue #948).
+pub fn funded_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::FundedAmount(invoice_id)
+}
+
+/// Per-invoice released amount — persistent storage.
+pub fn released_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::ReleasedAmount(invoice_id)
+}
+
+/// Per-invoice refunded amount — persistent storage.
+pub fn refunded_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::RefundedAmount(invoice_id)
+}
+
+/// Per-invoice status discriminant — persistent storage.
+pub fn status_field_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::StatusField(invoice_id)
+}
+
+/// Per-invoice recipient count — persistent storage.
+pub fn recipient_count_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::RecipientCount(invoice_id)
+}
+
+/// Per-invoice paid-recipient count — persistent storage.
+pub fn paid_count_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::PaidCount(invoice_id)
+}
+
+/// Per-invoice last-modified ledger — persistent storage.
+pub fn last_modified_ledger_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::LastModifiedLedger(invoice_id)
+}
+
+/// Per-(invoice, recipient) paid flag — persistent storage.
+///
+/// Lets a single payout mark one recipient paid without rewriting the whole
+/// `PaidFlags` vector (issue #948).
+pub fn recipient_paid_key(invoice_id: u64, recipient: Address) -> CompoundKey {
+    CompoundKey::RecipientPaid(invoice_id, recipient)
+}
+
+/// Per-address running total — persistent storage.
+pub fn address_total_key(address: Address) -> AddressKey {
+    AddressKey::AddressTotal(address)
+}
+
+/// Per-address last-activity ledger — persistent storage.
+pub fn address_last_active_key(address: Address) -> AddressKey {
+    AddressKey::AddressLastActive(address)
+}
+
+/// Contract-wide incremental state version — instance storage.
+///
+/// Bumped on every incremental write so readers can detect stale views
+/// without re-reading the full entry (issue #948).
+pub fn state_version_key() -> StorageKey {
+    StorageKey::StateVersion
+}
+
+/// Bitmask of dirty per-field flags for the pending incremental flush —
+/// instance storage (issue #948).
+pub fn dirty_field_mask_key() -> StorageKey {
+    StorageKey::DirtyFieldMask
 }
 

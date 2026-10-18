@@ -37,6 +37,7 @@ use crate::types::BASIS_POINTS_TOTAL;
 use soroban_sdk::{Address, Env, Map, Vec};
 
 use crate::error::ContractError;
+use crate::math::{bps_of, mul_div, BPS_DENOMINATOR};
 
 /// Distribute `total` among recipients according to their `ratios` out of
 /// `denom`, using the largest-remainder method to handle rounding.
@@ -75,13 +76,18 @@ pub fn distribute_with_remainder(
 
     let n = ratios.len() as usize;
 
-    // Compute floor shares and remainders.
+    // Compute floor shares and remainders using fixed-point helpers.
+    // `mul_div` performs the same floor division as `total * r / denom` but
+    // guards against intermediate overflow, and `mul_mod` gives the exact
+    // remainder needed for the largest-remainder step.
     let mut shares = Vec::new(env);
     let mut remainders = Vec::new(env);
 
     for r in ratios.iter() {
-        shares.push_back(total * r / denom);
-        remainders.push_back(total * r % denom);
+        let share = mul_div(total, r, denom)?;
+        let rem = mul_mod(total, r, denom)?;
+        shares.push_back(share);
+        remainders.push_back(rem);
     }
 
     // How many extra stroops to distribute?
@@ -196,8 +202,9 @@ pub fn funding_bps(funded: i128, total: i128) -> u32 {
     if funded >= total {
         return 10_000;
     }
-    // funded < total, both positive — safe to cast to u128 and divide.
-    let bps = (funded as u128 * 10_000u128) / (total as u128);
+    // funded < total, both positive — fixed-point helper computes
+    // `funded * 10_000 / total` with overflow-safe intermediate math.
+    let bps = bps_of(funded, total);
     // bps is in [0, 9_999] since funded < total; the clamp is a safeguard.
     bps.min(10_000) as u32
 }
@@ -222,11 +229,9 @@ pub fn calc_platform_fee(funded: i128, fee_bps: u32) -> Result<i128, ContractErr
     if fee_bps == 0 || funded == 0 {
         return Ok(0);
     }
-    let fee = (funded as i128)
-        .checked_mul(fee_bps as i128)
-        .ok_or(ContractError::ArithmeticOverflow)?
-        / 10_000;
-    Ok(fee)
+    // `mul_div` computes `funded * fee_bps / 10_000` with overflow-safe
+    // intermediate arithmetic, preserving the previous checked-mul semantics.
+    mul_div(funded, fee_bps as i128, BPS_DENOMINATOR)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,5 +469,78 @@ mod tests {
         // i128::MAX * 2 overflows the intermediate multiplication
         let result = calc_platform_fee(i128::MAX, 2);
         assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
+
+    // -----------------------------------------------------------------------
+    // Fixed-point migration tests (issue #947)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distribute_matches_naive_floor_division() {
+        // The fixed-point path must produce identical shares/remainders to the
+        // original `total * r / denom` and `total * r % denom` computation.
+        let env = Env::default();
+        let cases: &[(i128, &[i128], i128)] = &[
+            (1_000, &[1, 2, 3], 6),
+            (999, &[1, 3], 4),
+            (1_000_000_007, &[1, 1, 1, 1, 1, 1, 1], 7),
+            (123_456_789, &[100_000, 200_000, 300_000], 600_000),
+        ];
+        for &(total, ratios, denom) in cases {
+            let r_vec = make_ratios(&env, ratios);
+            let result = distribute_with_remainder(&env, total, &r_vec, denom).unwrap();
+            let mut naive = Vec::new(&env);
+            for r in r_vec.iter() {
+                naive.push_back(total * r / denom);
+            }
+            let naive_sum: i128 = naive.iter().sum();
+            let result_sum: i128 = result.iter().sum();
+            assert_eq!(result_sum, total);
+            // Each share is either the naive floor or one stroop more.
+            for i in 0..r_vec.len() {
+                let got = result.get(i).unwrap();
+                let floor = naive.get(i).unwrap();
+                assert!(got == floor || got == floor + 1);
+            }
+            assert!(naive_sum <= total);
+        }
+    }
+
+    #[test]
+    fn test_distribute_overflow_returns_error() {
+        // `total * r` would overflow i128; the fixed-point helper must surface
+        // ArithmeticOverflow instead of panicking.
+        let env = Env::default();
+        let ratios = make_ratios(&env, &[i128::MAX, 1]);
+        let result = distribute_with_remainder(&env, i128::MAX, &ratios, 2);
+        assert_eq!(result, Err(ContractError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn test_funding_bps_rounding() {
+        // 1/3 of the way funded → floor(3333.33) = 3333 bps
+        assert_eq!(funding_bps(1, 3), 3_333);
+        // 2/3 → floor(6666.66) = 6666 bps
+        assert_eq!(funding_bps(2, 3), 6_666);
+        // 1 stroop out of 3 → 3333 bps
+        assert_eq!(funding_bps(1, 10_000), 1);
+    }
+
+    #[test]
+    fn test_funding_bps_large_values_no_overflow() {
+        // Large funded/total values must not overflow the intermediate product.
+        let bps = funding_bps(i128::MAX / 2, i128::MAX);
+        assert!(bps <= 10_000);
+        assert!(bps > 4_999);
+    }
+
+    #[test]
+    fn test_calc_platform_fee_rounding() {
+        // 1 stroop at 5_000 bps → 0.5 stroops → floor = 0
+        assert_eq!(calc_platform_fee(1, 5_000).unwrap(), 0);
+        // 3 stroops at 5_000 bps → 1.5 stroops → floor = 1
+        assert_eq!(calc_platform_fee(3, 5_000).unwrap(), 1);
+        // 1_000 stroops at 1 bps → 0.1 stroops → floor = 0
+        assert_eq!(calc_platform_fee(1_000, 1).unwrap(), 0);
     }
 }

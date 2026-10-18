@@ -1915,6 +1915,92 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
 }
 
 // ---------------------------------------------------------------------------
+// Issue #957 — Guard failure events
+// ---------------------------------------------------------------------------
+
+/// Emitted whenever a release guard prevents an operation from proceeding.
+///
+/// # Indexer Guide
+/// Filter events with topic[1] == "guard_fail" to observe every blocked
+/// operation. The specific guard is carried in topic[2] as a short `Symbol`
+/// (see [`guard_names`] for the canonical set), so indexers can narrow to a
+/// single guard by matching that topic. The data payload is a
+/// [`GuardFailure`] struct carrying:
+///   - `guard`: the guard identifier (redundant with topic[2], included so the
+///     event can be decoded from data alone).
+///   - `invoice_id`: the invoice the guard applied to (`0` for contract-level
+///     guards that are not scoped to an invoice).
+///   - `actor`: the address whose operation was blocked.
+///   - `ledger`: the ledger sequence at which the guard fired.
+///   - `detail`: a short human-readable reason / offending value.
+///
+/// Topics: (split, guard_fail, guard)
+/// Data: GuardFailure { guard, invoice_id, actor, ledger, detail }
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardFailure {
+    pub guard: soroban_sdk::Symbol,
+    pub invoice_id: u64,
+    pub actor: Address,
+    pub ledger: u32,
+    pub detail: String,
+}
+
+/// Emit a structured guard-failure event.
+///
+/// `guard` identifies which release guard blocked the operation; `invoice_id`
+/// is the affected invoice (`0` when the guard is contract-level); `actor` is
+/// the address whose operation was rejected; `detail` is a short reason.
+pub fn guard_failed(
+    env: &Env,
+    guard: &soroban_sdk::Symbol,
+    invoice_id: u64,
+    actor: &Address,
+    detail: &String,
+) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("guard_fail"),
+            guard.clone(),
+        ),
+        GuardFailure {
+            guard: guard.clone(),
+            invoice_id,
+            actor: actor.clone(),
+            ledger: env.ledger().sequence(),
+            detail: detail.clone(),
+        },
+    );
+}
+
+/// Canonical guard identifiers emitted by [`guard_failed`].
+///
+/// Indexers can use this list to enumerate the guards they may observe in the
+/// `guard_fail` event's topic[2] / `GuardFailure::guard` field.
+pub fn guard_names(env: &Env) -> Vec<soroban_sdk::Symbol> {
+    Vec::from_array(
+        env,
+        [
+            symbol_short!("paused"),
+            symbol_short!("frozen"),
+            symbol_short!("expired"),
+            symbol_short!("deadline"),
+            symbol_short!("not_rdy"),
+            symbol_short!("cosigner"),
+            symbol_short!("cond"),
+            symbol_short!("allowlst"),
+            symbol_short!("nft_gate"),
+            symbol_short!("cap"),
+            symbol_short!("cooldown"),
+            symbol_short!("disputed"),
+            symbol_short!("phase"),
+            symbol_short!("timelock"),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
 
@@ -1960,5 +2046,53 @@ mod tests {
             // Invoice 20 is still at 2 after one more call.
             assert_eq!(next_seq(&env, 20), 2);
         });
+    }
+
+    /// `guard_failed` publishes a `guard_fail` event carrying the guard in
+    /// topic[2] and a full `GuardFailure` payload in the data.
+    #[test]
+    fn test_guard_failed_emits_event_with_data() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{String, Symbol};
+
+        let env = Env::default();
+        let id = contract_id(&env);
+        let actor = Address::generate(&env);
+        let guard = symbol_short!("paused");
+        let detail = String::from_str(&env, "invoice paused");
+
+        env.as_contract(&id, || {
+            guard_failed(&env, &guard, 42, &actor, &detail);
+        });
+
+        let events = env.events().all();
+        let last = events.last().expect("expected a guard_fail event");
+        let (emitter, topics, data) = last;
+        assert_eq!(emitter, id);
+        assert_eq!(topics.len(), 3);
+        assert_eq!(
+            topics.get(1).unwrap(),
+            soroban_sdk::Val::from(symbol_short!("guard_fail"))
+        );
+        assert_eq!(topics.get(2).unwrap(), soroban_sdk::Val::from(guard));
+
+        let payload: GuardFailure = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.guard, symbol_short!("paused"));
+        assert_eq!(payload.invoice_id, 42);
+        assert_eq!(payload.actor, actor);
+        assert_eq!(payload.detail, detail);
+    }
+
+    /// `guard_names` returns a non-empty, deduplicated list of guard symbols.
+    #[test]
+    fn test_guard_names_enumerates_guards() {
+        let env = Env::default();
+        let names = guard_names(&env);
+        assert!(!names.is_empty());
+        for i in 0..names.len() {
+            for j in (i + 1)..names.len() {
+                assert_ne!(names.get(i).unwrap(), names.get(j).unwrap());
+            }
+        }
     }
 }
