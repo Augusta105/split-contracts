@@ -8688,3 +8688,385 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #950 — Batch query API
+// ---------------------------------------------------------------------------
+
+/// Build a batch query for a single invoice id.
+fn batch_query(env: &Env, id: u64) -> types::BatchQuery {
+    types::BatchQuery {
+        invoice_ids: {
+            let mut ids = Vec::new(env);
+            ids.push_back(id);
+            ids
+        },
+        include_ext: false,
+        include_ext2: false,
+        include_audit_log: false,
+    }
+}
+
+#[test]
+fn test_batch_query_preserves_request_order() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    // Request in a deliberately non-ascending order.
+    let mut ids = Vec::new(&env);
+    ids.push_back(id3);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    let query = types::BatchQuery {
+        invoice_ids: ids,
+        include_ext: false,
+        include_ext2: false,
+        include_audit_log: false,
+    };
+    let results = c.batch_query(&query);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get_unchecked(0).invoice.id, id3);
+    assert_eq!(results.get_unchecked(1).invoice.id, id1);
+    assert_eq!(results.get_unchecked(2).invoice.id, id2);
+    assert_eq!(results.get_unchecked(0).invoice.amounts.get_unchecked(0), 300);
+    assert_eq!(results.get_unchecked(1).invoice.amounts.get_unchecked(0), 100);
+    assert_eq!(results.get_unchecked(2).invoice.amounts.get_unchecked(0), 200);
+}
+
+#[test]
+fn test_batch_query_deduplicates_repeated_ids() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    ids.push_back(id);
+    ids.push_back(id);
+
+    let query = types::BatchQuery {
+        invoice_ids: ids,
+        include_ext: false,
+        include_ext2: false,
+        include_audit_log: false,
+    };
+    let results = c.batch_query(&query);
+
+    // Duplicate ids collapse to a single result.
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get_unchecked(0).invoice.id, id);
+}
+
+#[test]
+fn test_batch_query_empty_batch_returns_empty() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let query = types::BatchQuery {
+        invoice_ids: Vec::new(&env),
+        include_ext: false,
+        include_ext2: false,
+        include_audit_log: false,
+    };
+    let results = c.batch_query(&query);
+    assert_eq!(results.len(), 0);
+}
+
+#[test]
+fn test_batch_query_rejects_oversized_batch() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Build a batch larger than the maximum allowed size.
+    let mut ids = Vec::new(&env);
+    for _ in 0..(types::MAX_BATCH_QUERY_SIZE + 1) {
+        ids.push_back(id);
+    }
+
+    let query = types::BatchQuery {
+        invoice_ids: ids,
+        include_ext: false,
+        include_ext2: false,
+        include_audit_log: false,
+    };
+    let res = c.try_batch_query(&query);
+    assert!(res.is_err(), "oversized batch must be rejected");
+}
+
+#[test]
+fn test_batch_query_includes_optional_sections() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let query = types::BatchQuery {
+        invoice_ids: {
+            let mut ids = Vec::new(&env);
+            ids.push_back(id);
+            ids
+        },
+        include_ext: true,
+        include_ext2: true,
+        include_audit_log: true,
+    };
+    let results = c.batch_query(&query);
+    assert_eq!(results.len(), 1);
+    let entry = results.get_unchecked(0);
+    assert_eq!(entry.invoice.id, id);
+    assert!(entry.ext.is_some());
+    assert!(entry.ext2.is_some());
+    assert!(entry.audit_log.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #952 — Error recovery suggestions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recovery_suggestion_non_empty_for_known_errors() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let errors = [
+        ContractError::InvoiceNotFound,
+        ContractError::InvoiceAlreadyReleased,
+        ContractError::InvoiceAlreadyRefunded,
+        ContractError::InvoiceExpired,
+        ContractError::Unauthorized,
+        ContractError::InvalidAmount,
+        ContractError::InvoiceFrozen,
+        ContractError::InvoiceDeleted,
+        ContractError::FundsUnclaimed,
+        ContractError::NotDeleted,
+        ContractError::BatchTooLarge,
+    ];
+
+    for err in errors {
+        let suggestion = c.get_recovery_suggestion(&err);
+        assert!(
+            !suggestion.is_empty(),
+            "recovery suggestion for {:?} must not be empty",
+            err
+        );
+    }
+}
+
+#[test]
+fn test_recovery_suggestion_unknown_error_has_fallback() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    // An error code that has no dedicated suggestion still yields guidance.
+    let suggestion = c.get_recovery_suggestion(&ContractError::InvalidRatioSum);
+    assert!(!suggestion.is_empty());
+}
+
+#[test]
+fn test_failed_payment_leaves_state_unchanged() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Overpayment must fail and leave the invoice and balances untouched.
+    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err());
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 0);
+    assert_eq!(invoice.payments.len(), 0);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+    assert_eq!(tk.balance(&payer), 1_000);
+    assert_eq!(tk.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_failed_refund_leaves_state_unchanged() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+
+    // Refund before the deadline must fail and leave funds in the contract.
+    let res = c.try_refund(&id);
+    assert!(res.is_err());
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Pending);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(tk.balance(&payer), 0);
+    assert_eq!(tk.balance(&contract_id), 100);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #954 — Payment event breakdown
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_payment_breakdown_gross_equals_fee_plus_net() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    let breakdown = c.get_payment_breakdown(&id, &0_u32);
+    assert_eq!(breakdown.gross, 200);
+    assert_eq!(breakdown.fee + breakdown.net, breakdown.gross);
+    assert!(breakdown.fee >= 0);
+    assert!(breakdown.net >= 0);
+}
+
+#[test]
+fn test_payment_breakdown_totals_match_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id, &150_i128, &1_u64, &false, &false, &None);
+
+    let invoice = c.get_invoice(&id);
+    let mut gross_total: i128 = 0;
+    let mut fee_total: i128 = 0;
+    let mut net_total: i128 = 0;
+    for i in 0..invoice.payments.len() {
+        let b = c.get_payment_breakdown(&id, &i);
+        assert_eq!(b.gross, b.fee + b.net);
+        gross_total += b.gross;
+        fee_total += b.fee;
+        net_total += b.net;
+    }
+    assert_eq!(gross_total, invoice.funded);
+    assert_eq!(fee_total + net_total, gross_total);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #956 — Refund reason tracking
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_refund_reason_stored_and_emitted() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+
+    // The reason is persisted with the invoice.
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.status, InvoiceStatus::Refunded);
+    assert_eq!(invoice.refund_reason, Some(types::RefundReason::Expired));
+
+    // The refund event carries the same reason.
+    let has_reason_event = env
+        .events()
+        .all()
+        .events()
+        .iter()
+        .any(|event| {
+            xdr_event_topics(&env, event)
+                .map(|topics| topic0_is(&env, &topics, "refunded"))
+                .unwrap_or(false)
+        });
+    assert!(has_reason_event, "expected a refund event with a reason");
+}
+
+#[test]
+fn test_refund_reason_variants_are_distinct() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    // Expired-deadline refund.
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+    assert_eq!(
+        c.get_invoice(&id).refund_reason,
+        Some(types::RefundReason::Expired)
+    );
+
+    // Creator-cancelled refund.
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id2, &100_i128, &0_u64, &false, &false, &None);
+    c.cancel_invoice(&creator, &id2);
+    assert_eq!(
+        c.get_invoice(&id2).refund_reason,
+        Some(types::RefundReason::Cancelled)
+    );
+}
+

@@ -843,3 +843,276 @@ fn test_release_emits_escrow_released_event() {
     }
     assert!(found, "EscrowReleased event was not emitted during release");
 }
+
+// ---------------------------------------------------------------------------
+// #956: refund reason tracking
+// ---------------------------------------------------------------------------
+
+use crate::types::RefundReason;
+
+/// Advance the ledger timestamp past `deadline` so refunds are permitted.
+fn advance_past_deadline(env: &Env, deadline: u64) {
+    env.ledger().set(LedgerInfo {
+        timestamp: deadline + 1,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3_110_400,
+    });
+}
+
+/// Returns true if a `refund` / `rfnd_rsn` event carrying `reason` was emitted.
+fn refund_reason_event_emitted(env: &Env, reason: &RefundReason) -> bool {
+    let events = env.events().all();
+    events.events().iter().any(|event| {
+        if let Some(topics) = xdr_event_topics(env, event) {
+            if topics.len() < 2 {
+                return false;
+            }
+            let t0 = <soroban_sdk::Symbol as soroban_sdk::TryFromVal<Env, Val>>::try_from_val(
+                env,
+                &topics.get_unchecked(0),
+            );
+            let t1 = <soroban_sdk::Symbol as soroban_sdk::TryFromVal<Env, Val>>::try_from_val(
+                env,
+                &topics.get_unchecked(1),
+            );
+            if let (Ok(t0), Ok(t1)) = (t0, t1) {
+                if t0 == symbol_short!("escrow") && t1 == symbol_short!("rfnd_rsn") {
+                    // Reason is expected as the first data element.
+                    let data: soroban_sdk::Vec<Val> = event
+                        .body
+                        .value()
+                        .clone()
+                        .try_into_val(env)
+                        .unwrap_or_else(|_| soroban_sdk::Vec::new(env));
+                    if let Some(first) = data.first() {
+                        if let Ok(emitted) =
+                            <RefundReason as soroban_sdk::TryFromVal<Env, Val>>::try_from_val(
+                                env, &first,
+                            )
+                        {
+                            return &emitted == reason;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    })
+}
+
+fn setup_refundable_invoice(
+    env: &Env,
+    client: &InvoiceEscrowContractClient,
+    deposit: i128,
+) -> (Address, Address, Address, u64) {
+    let admin = Address::generate(env);
+    let creator = Address::generate(env);
+    let payer = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = create_token(env, &token_admin);
+
+    mint(env, &token, &token_admin, &payer, deposit * 2);
+    client.initialize(&admin);
+
+    let deadline = env.ledger().timestamp() + 1;
+    let id = client.create_invoice(&creator, &token, &deposit, &deadline);
+    client.deposit(&payer, &id, &deposit);
+
+    advance_past_deadline(env, deadline);
+    (token, payer, token, id)
+}
+
+#[test]
+fn test_refund_reason_deadline_passed_emitted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let (token, payer, _t, id) = setup_refundable_invoice(&env, &client, 500_000);
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund(&id, &payers);
+
+    assert!(
+        refund_reason_event_emitted(&env, &RefundReason::DeadlinePassed),
+        "refund reason DeadlinePassed not emitted"
+    );
+
+    // State consistent: invoice refunded, payer made whole.
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Refunded);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 1_000_000);
+}
+
+#[test]
+fn test_refund_reason_cancelled_emitted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let (token, payer, _t, id) = setup_refundable_invoice(&env, &client, 400_000);
+
+    // Admin cancels the invoice, then refunds with the Cancelled reason.
+    let admin = client.get_admin();
+    client.cancel_invoice(&id);
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund_with_reason(&id, &payers, &RefundReason::Cancelled);
+
+    assert!(
+        refund_reason_event_emitted(&env, &RefundReason::Cancelled),
+        "refund reason Cancelled not emitted"
+    );
+
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Refunded);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 800_000);
+    let _ = admin;
+}
+
+#[test]
+fn test_refund_reason_admin_override_emitted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let (token, payer, _t, id) = setup_refundable_invoice(&env, &client, 300_000);
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund_with_reason(&id, &payers, &RefundReason::AdminOverride);
+
+    assert!(
+        refund_reason_event_emitted(&env, &RefundReason::AdminOverride),
+        "refund reason AdminOverride not emitted"
+    );
+
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Refunded);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 600_000);
+}
+
+#[test]
+fn test_refund_reason_mutual_agreement_emitted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let (token, payer, _t, id) = setup_refundable_invoice(&env, &client, 250_000);
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund_with_reason(&id, &payers, &RefundReason::MutualAgreement);
+
+    assert!(
+        refund_reason_event_emitted(&env, &RefundReason::MutualAgreement),
+        "refund reason MutualAgreement not emitted"
+    );
+
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Refunded);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 500_000);
+}
+
+#[test]
+fn test_refund_reason_not_emitted_on_failed_refund() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    mint(&env, &token, &token_admin, &payer, 1_000_000);
+    client.initialize(&admin);
+    let deadline = env.ledger().timestamp() + 100_000;
+    let id = client.create_invoice(&creator, &token, &500_000, &deadline);
+    client.deposit(&payer, &id, &500_000);
+
+    // Refund before deadline must fail and emit no reason event.
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    let result = client.try_refund_with_reason(&id, &payers, &RefundReason::DeadlinePassed);
+    assert_eq!(result, Err(Ok(Error::DeadlineNotPassed)));
+
+    assert!(
+        !refund_reason_event_emitted(&env, &RefundReason::DeadlinePassed),
+        "refund reason must not be emitted on failed refund"
+    );
+
+    // State consistent: invoice still active, funds still escrowed.
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Active);
+    assert_eq!(invoice.funded_amount, 500_000);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 500_000);
+}
+
+// ---------------------------------------------------------------------------
+// #952: error recovery suggestions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recovery_suggestion_for_deadline_passed() {
+    let suggestion = InvoiceEscrowContract::recovery_suggestion(&Error::DeadlinePassed);
+    assert_eq!(suggestion, symbol_short!("wait_dl"));
+}
+
+#[test]
+fn test_recovery_suggestion_for_over_funded() {
+    let suggestion = InvoiceEscrowContract::recovery_suggestion(&Error::OverFunded);
+    assert_eq!(suggestion, symbol_short!("reduce_amt"));
+}
+
+#[test]
+fn test_recovery_suggestion_for_payer_blacklisted() {
+    let suggestion = InvoiceEscrowContract::recovery_suggestion(&Error::PayerBlacklisted);
+    assert_eq!(suggestion, symbol_short!("appeal"));
+}
+
+#[test]
+fn test_recovery_suggestion_for_not_admin() {
+    let suggestion = InvoiceEscrowContract::recovery_suggestion(&Error::NotAdmin);
+    assert_eq!(suggestion, symbol_short!("use_admin"));
+}
+
+#[test]
+fn test_recovery_suggestion_for_not_initialized() {
+    let suggestion = InvoiceEscrowContract::recovery_suggestion(&Error::NotInitialized);
+    assert_eq!(suggestion, symbol_short!("init_first"));
+}
+
+#[test]
+fn test_failed_deposit_leaves_state_consistent() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    mint(&env, &token, &token_admin, &payer, 2_000_000);
+    client.initialize(&admin);
+    let deadline = env.ledger().timestamp() + 10_000;
+    let id = client.create_invoice(&creator, &token, &1_000_000, &deadline);
+
+    // Over-funded deposit fails; no funds move and invoice stays Pending.
+    let result = client.try_deposit(&payer, &id, &1_500_000);
+    assert_eq!(result, Err(Ok(Error::OverFunded)));
+
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Pending);
+    assert_eq!(invoice.funded_amount, 0);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 2_000_000);
+
+    // Recovery: retry with a valid amount succeeds.
+    client.deposit(&payer, &id, &1_000_000);
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Released);
+}

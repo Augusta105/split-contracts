@@ -2,6 +2,23 @@
 
 use soroban_sdk::{contracttype, Address, BytesN};
 
+/// Reason a refund was issued, recorded on the invoice and emitted in the
+/// refund event so indexers can categorise refunds.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefundReason {
+    /// Deadline passed without the invoice being fully funded.
+    DeadlineExpired,
+    /// Admin cancelled the invoice before release.
+    AdminCancelled,
+    /// Invoice was over-funded and the excess is being returned.
+    Overfunded,
+    /// Payer requested a refund before the deadline.
+    PayerRequested,
+    /// Refund issued as part of an error recovery path.
+    ErrorRecovery,
+}
+
 /// Lifecycle state of an escrow invoice.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +51,25 @@ pub struct EscrowInvoice {
     pub deadline: u64,
     /// Current lifecycle status.
     pub status: EscrowStatus,
+    /// Reason recorded for the most recent refund, if any.
+    pub refund_reason: Option<RefundReason>,
+}
+
+/// Emitted when funds are refunded to a payer.
+///
+/// Event topics: `(escrow, refunded)`
+/// Event data: `EscrowRefunded { invoice_id, payer, amount, reason }`
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowRefunded {
+    /// The ID of the invoice that was refunded.
+    pub invoice_id: u64,
+    /// The address that received the refund.
+    pub payer: Address,
+    /// The amount of tokens refunded.
+    pub amount: i128,
+    /// The reason the refund was issued.
+    pub reason: RefundReason,
 }
 
 /// Emitted when the admin initiates a two-step admin authority transfer.
@@ -124,4 +160,33 @@ pub struct BlacklistEntry {
     pub upheld: bool,
     /// Hash of the reason for blacklisting (provided by admin).
     pub reason_hash: BytesN<32>,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Error recovery suggestions
+// ──────────────────────────────────────────────────────────────────────
+
+/// Returns an actionable recovery suggestion for a given contract error.
+///
+/// The returned string is a short, human-readable hint describing how a
+/// caller can recover from the error (e.g. retry, top up funds, wait for
+/// the deadline). Unknown errors fall back to a generic suggestion.
+pub fn get_recovery_suggestion(error: &crate::Error) -> &'static str {
+    use crate::Error;
+    match error {
+        Error::NotInitialized => "Contract is not initialized; call initialize first.",
+        Error::AlreadyInitialized => "Contract is already initialized; no action needed.",
+        Error::Unauthorized => "Caller is not authorized; use the admin or invoice creator.",
+        Error::InvoiceNotFound => "Invoice does not exist; verify the invoice ID.",
+        Error::InvalidAmount => "Amount must be positive; provide a valid amount.",
+        Error::InvalidStatus => "Invoice is in the wrong state; check its current status.",
+        Error::DeadlineNotReached => "Deadline has not passed; wait until the deadline.",
+        Error::DeadlinePassed => "Deadline has passed; refunds are now available.",
+        Error::AlreadyFullyFunded => "Invoice is fully funded; no further deposits needed.",
+        Error::InsufficientFunds => "Insufficient balance; top up the payer account.",
+        Error::PayerBlacklisted => "Payer is blacklisted; submit an appeal or use another payer.",
+        Error::TransferFailed => "Token transfer failed; retry or verify token allowance.",
+        Error::Overflow => "Arithmetic overflow; reduce the amount and retry.",
+        _ => "Unexpected error; retry the operation or contact support.",
+    }
 }

@@ -15846,6 +15846,85 @@ impl SplitContract {
             ((invoice.funded * 10_000) / total) as u32
         }
     }
+
+    /// Issue #950: Execute a batch of read-only queries in a single call.
+    ///
+    /// Queries are answered in the order they were supplied. Invoice and stats
+    /// reads are cached within the batch, so repeated invoice ids are only
+    /// loaded from storage once. Batches larger than
+    /// `types::MAX_BATCH_QUERIES` are rejected with `ContractError::InvalidAmount`.
+    pub fn batch_query(env: Env, queries: Vec<types::Query>) -> Vec<types::QueryResult> {
+        if queries.len() as u32 > types::MAX_BATCH_QUERIES {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+
+        // Per-batch caches: invoice id -> loaded invoice, and invoice id -> stats.
+        let mut invoice_cache: Map<u64, Invoice> = Map::new(&env);
+        let mut stats_cache: Map<u64, InvoiceStats> = Map::new(&env);
+
+        let mut results: Vec<types::QueryResult> = Vec::new(&env);
+        for query in queries.iter() {
+            let result = match query {
+                types::Query::GetInvoice(id) => {
+                    let invoice = match invoice_cache.get(id) {
+                        Some(cached) => cached,
+                        None => {
+                            let loaded = load_invoice(&env, id);
+                            invoice_cache.set(id, loaded.clone());
+                            loaded
+                        }
+                    };
+                    types::QueryResult::Invoice(invoice)
+                }
+                types::Query::GetInvoiceStatus(id) => {
+                    let invoice = match invoice_cache.get(id) {
+                        Some(cached) => cached,
+                        None => {
+                            let loaded = load_invoice(&env, id);
+                            invoice_cache.set(id, loaded.clone());
+                            loaded
+                        }
+                    };
+                    types::QueryResult::InvoiceStatus(invoice.status)
+                }
+                types::Query::GetInvoiceStats(id) => {
+                    let stats = match stats_cache.get(id) {
+                        Some(cached) => cached,
+                        None => {
+                            let loaded = load_invoice_stats(&env, id);
+                            stats_cache.set(id, loaded.clone());
+                            loaded
+                        }
+                    };
+                    types::QueryResult::InvoiceStats(stats)
+                }
+                types::Query::GetPayerTotal(id, payer) => {
+                    let amount = Self::get_payer_total(env.clone(), id, payer);
+                    types::QueryResult::PayerTotal(amount)
+                }
+                types::Query::GetFundingPercentage(id) => {
+                    let invoice = match invoice_cache.get(id) {
+                        Some(cached) => cached,
+                        None => {
+                            let loaded = load_invoice(&env, id);
+                            invoice_cache.set(id, loaded.clone());
+                            loaded
+                        }
+                    };
+                    let total: i128 = invoice.amounts.iter().sum();
+                    let bps = if total == 0 {
+                        0
+                    } else {
+                        ((invoice.funded * 10_000) / total) as u32
+                    };
+                    types::QueryResult::FundingPercentage(bps)
+                }
+            };
+            results.push_back(result);
+        }
+
+        results
+    }
 }
 
 /// Move a finalised invoice from hot storage to cold archival storage.

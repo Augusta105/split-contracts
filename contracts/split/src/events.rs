@@ -30,6 +30,56 @@ use crate::types::{DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, Overfu
 use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Vec};
 
 // ---------------------------------------------------------------------------
+// Payment event details (issue #954)
+// ---------------------------------------------------------------------------
+
+/// Per-recipient breakdown of a payment, included in payment events so
+/// indexers can attribute gross/fee/net amounts without re-deriving them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentBreakdown {
+    pub recipient: Address,
+    pub gross: i128,
+    pub fee: i128,
+    pub net: i128,
+}
+
+/// Metadata carried alongside a payment event's breakdown.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentEventMetadata {
+    pub invoice_id: u64,
+    pub payer: Address,
+    pub timestamp: u64,
+    pub total: i128,
+}
+
+/// Full payload emitted for payment events: metadata plus the per-recipient
+/// breakdown.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentEvent {
+    pub metadata: PaymentEventMetadata,
+    pub breakdown: Vec<PaymentBreakdown>,
+}
+
+// ---------------------------------------------------------------------------
+// Refund reason tracking (issue #956)
+// ---------------------------------------------------------------------------
+
+/// Reason a refund was issued, emitted with refund events so indexers can
+/// categorise refunds without inspecting contract state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefundReason {
+    Expired,
+    Cancelled,
+    Dispute,
+    AdminOverride,
+    Overpayment,
+}
+
+// ---------------------------------------------------------------------------
 // Event sequence helper (per-invoice, temporary-storage counter)
 // ---------------------------------------------------------------------------
 
@@ -86,6 +136,31 @@ pub fn payment_received(env: &Env, invoice_id: u64, payer: &Address, amount: i12
     env.events().publish(
         (symbol_short!("split"), symbol_short!("paid"), invoice_id),
         (payer.clone(), amount, token.clone(), event_seq),
+    );
+}
+
+/// Issue #954: Emitted when a payment is received, carrying the full
+/// per-recipient breakdown plus metadata.
+/// Topics: (split, pay_dtl, invoice_id)
+/// Data: PaymentEvent { metadata, breakdown }
+pub fn payment_received_detailed(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    total: i128,
+    breakdown: &Vec<PaymentBreakdown>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pay_dtl"), invoice_id),
+        PaymentEvent {
+            metadata: PaymentEventMetadata {
+                invoice_id,
+                payer: payer.clone(),
+                timestamp: env.ledger().timestamp(),
+                total,
+            },
+            breakdown: breakdown.clone(),
+        },
     );
 }
 
@@ -158,6 +233,26 @@ pub fn invoice_refunded(env: &Env, invoice_id: u64, amount: i128) {
             invoice_id,
         ),
         (invoice_id, amount, event_seq),
+    );
+}
+
+/// Issue #956: Emitted when an invoice is refunded, carrying the reason.
+/// Topics: (split, refunded, invoice_id)
+/// Data: (invoice_id, amount, reason, event_seq)
+pub fn invoice_refunded_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    amount: i128,
+    reason: &RefundReason,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("refunded"),
+            invoice_id,
+        ),
+        (invoice_id, amount, *reason, event_seq),
     );
 }
 
@@ -772,6 +867,23 @@ pub fn refund_claimed(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
     env.events().publish(
         (symbol_short!("split"), symbol_short!("ref_clm"), invoice_id),
         (payer.clone(), amount),
+    );
+}
+
+/// Issue #956: Emitted when a payer claims their per-payer refund, carrying
+/// the reason the refund was issued.
+/// Topics: (split, ref_clm, invoice_id)
+/// Data: (payer, amount, reason)
+pub fn refund_claimed_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    amount: i128,
+    reason: &RefundReason,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ref_clm"), invoice_id),
+        (payer.clone(), amount, *reason),
     );
 }
 
@@ -1434,6 +1546,26 @@ pub fn refund_issued(env: &Env, invoice_id: u64, payer: &Address, refund_amount:
     );
 }
 
+/// Issue #956: Emitted when a partial refund is issued, carrying the reason.
+/// Topics: (split, RefundIssued, invoice_id)
+/// Data: (payer, refund_amount, reason)
+pub fn refund_issued_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    refund_amount: i128,
+    reason: &RefundReason,
+) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            soroban_sdk::Symbol::new(env, "RefundIssued"),
+            invoice_id,
+        ),
+        (payer.clone(), refund_amount, *reason),
+    );
+}
+
 /// Issue #471: Emitted when a recipient rotates their payout address.
 /// Topics: (split, RecipientAddressRotated, invoice_id)
 /// Data: (old_address, new_address)
@@ -1960,5 +2092,59 @@ mod tests {
             // Invoice 20 is still at 2 after one more call.
             assert_eq!(next_seq(&env, 20), 2);
         });
+    }
+
+    /// Issue #954: `PaymentBreakdown` preserves gross/fee/net values and the
+    /// `PaymentEvent` metadata is populated correctly.
+    #[test]
+    fn test_payment_event_breakdown_accuracy() {
+        let env = Env::default();
+        let recipient = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        let entry = PaymentBreakdown {
+            recipient: recipient.clone(),
+            gross: 1_000,
+            fee: 25,
+            net: 975,
+        };
+        assert_eq!(entry.gross - entry.fee, entry.net);
+
+        let mut breakdown = Vec::new(&env);
+        breakdown.push_back(entry.clone());
+
+        let event = PaymentEvent {
+            metadata: PaymentEventMetadata {
+                invoice_id: 42,
+                payer: payer.clone(),
+                timestamp: 1234,
+                total: 1_000,
+            },
+            breakdown: breakdown.clone(),
+        };
+
+        assert_eq!(event.metadata.invoice_id, 42);
+        assert_eq!(event.metadata.payer, payer);
+        assert_eq!(event.metadata.timestamp, 1234);
+        assert_eq!(event.metadata.total, 1_000);
+        assert_eq!(event.breakdown.len(), 1);
+        assert_eq!(event.breakdown.get(0).unwrap(), entry);
+    }
+
+    /// Issue #956: `RefundReason` variants are distinct and comparable.
+    #[test]
+    fn test_refund_reason_variants() {
+        let reasons = [
+            RefundReason::Expired,
+            RefundReason::Cancelled,
+            RefundReason::Dispute,
+            RefundReason::AdminOverride,
+            RefundReason::Overpayment,
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for (j, b) in reasons.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
     }
 }

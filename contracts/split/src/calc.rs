@@ -230,6 +230,87 @@ pub fn calc_platform_fee(funded: i128, fee_bps: u32) -> Result<i128, ContractErr
 }
 
 // ---------------------------------------------------------------------------
+// Issue #954 / #956: Payment event breakdown & refund reason helpers
+// ---------------------------------------------------------------------------
+
+/// Detailed, indexable breakdown of a single payment event.
+///
+/// The breakdown is derived from the same arithmetic used to distribute funds
+/// (see [`distribute_with_remainder`] and [`calc_platform_fee`]) so that the
+/// emitted event always reconciles with the amounts actually moved.
+///
+/// All fields are plain integers so the struct can be emitted directly as
+/// event data and indexed by off-chain consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentBreakdown {
+    /// Gross amount collected in this payment (stroops).
+    pub gross: i128,
+    /// Platform fee withheld from `gross` (stroops).
+    pub platform_fee: i128,
+    /// Net amount distributed to recipients (`gross - platform_fee`).
+    pub net: i128,
+    /// Number of recipients the net amount was split across.
+    pub recipient_count: u32,
+    /// Funding completion after this payment, in basis points (0 – 10_000).
+    pub funding_bps: u32,
+}
+
+impl PaymentBreakdown {
+    /// Build a breakdown from a gross payment amount, fee rate and funding state.
+    ///
+    /// # Errors
+    /// Propagates [`ContractError::ArithmeticOverflow`] from [`calc_platform_fee`].
+    pub fn new(
+        gross: i128,
+        fee_bps: u32,
+        recipient_count: u32,
+        funded_after: i128,
+        total: i128,
+    ) -> Result<Self, ContractError> {
+        let platform_fee = calc_platform_fee(gross, fee_bps)?;
+        let net = gross - platform_fee;
+        Ok(Self {
+            gross,
+            platform_fee,
+            net,
+            recipient_count,
+            funding_bps: funding_bps(funded_after, total),
+        })
+    }
+
+    /// Returns `true` when the breakdown is internally consistent:
+    /// `net == gross - platform_fee` and `funding_bps <= 10_000`.
+    pub fn is_consistent(&self) -> bool {
+        self.net == self.gross - self.platform_fee && self.funding_bps <= 10_000
+    }
+}
+
+/// Reason a refund was issued, emitted alongside every refund event.
+///
+/// Kept as a small, explicit enum so the reason is stable, indexable and
+/// self-describing to off-chain consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefundReason {
+    /// Invoice was cancelled before funding completed.
+    Cancelled = 0,
+    /// Invoice expired without reaching its funding goal.
+    Expired = 1,
+    /// Payer requested a refund explicitly.
+    Requested = 2,
+    /// Invoice was overfunded and the excess is being returned.
+    Overfunded = 3,
+    /// Refund issued due to a dispute resolution.
+    Dispute = 4,
+}
+
+impl RefundReason {
+    /// Stable numeric code suitable for event indexing.
+    pub fn code(&self) -> u32 {
+        *self as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -464,5 +545,78 @@ mod tests {
         // i128::MAX * 2 overflows the intermediate multiplication
         let result = calc_platform_fee(i128::MAX, 2);
         assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
+
+    // -----------------------------------------------------------------------
+    // PaymentBreakdown tests (Issue #954)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_payment_breakdown_normal() {
+        // 1_000_000 gross at 250 bps, 3 recipients, fully funded afterwards.
+        let b = PaymentBreakdown::new(1_000_000, 250, 3, 1_000_000, 1_000_000).unwrap();
+        assert_eq!(b.gross, 1_000_000);
+        assert_eq!(b.platform_fee, 25_000);
+        assert_eq!(b.net, 975_000);
+        assert_eq!(b.recipient_count, 3);
+        assert_eq!(b.funding_bps, 10_000);
+        assert!(b.is_consistent());
+    }
+
+    #[test]
+    fn test_payment_breakdown_partial_funding() {
+        let b = PaymentBreakdown::new(500, 0, 2, 500, 1_000).unwrap();
+        assert_eq!(b.platform_fee, 0);
+        assert_eq!(b.net, 500);
+        assert_eq!(b.funding_bps, 5_000);
+        assert!(b.is_consistent());
+    }
+
+    #[test]
+    fn test_payment_breakdown_overflow() {
+        let result = PaymentBreakdown::new(i128::MAX, 2, 1, 0, 0);
+        assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn test_payment_breakdown_reconciles_with_distribution() {
+        // Net amount must be exactly distributable across recipients.
+        let env = Env::default();
+        let b = PaymentBreakdown::new(1_000, 100, 3, 1_000, 1_000).unwrap();
+        let shares =
+            distribute_with_remainder(&env, b.net, &make_ratios(&env, &[1, 1, 1]), 3).unwrap();
+        let sum: i128 = shares.iter().sum();
+        assert_eq!(sum, b.net);
+    }
+
+    // -----------------------------------------------------------------------
+    // RefundReason tests (Issue #956)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_refund_reason_codes_are_stable() {
+        assert_eq!(RefundReason::Cancelled.code(), 0);
+        assert_eq!(RefundReason::Expired.code(), 1);
+        assert_eq!(RefundReason::Requested.code(), 2);
+        assert_eq!(RefundReason::Overfunded.code(), 3);
+        assert_eq!(RefundReason::Dispute.code(), 4);
+    }
+
+    #[test]
+    fn test_refund_reason_codes_are_unique() {
+        let reasons = [
+            RefundReason::Cancelled,
+            RefundReason::Expired,
+            RefundReason::Requested,
+            RefundReason::Overfunded,
+            RefundReason::Dispute,
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for (j, b) in reasons.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a.code(), b.code());
+                }
+            }
+        }
     }
 }

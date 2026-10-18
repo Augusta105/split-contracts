@@ -1882,6 +1882,42 @@ pub struct PaymentRecord {
     pub ledger: u32,
 }
 
+/// Issue #950: A single read-only query in a batch submitted to `batch_query`.
+///
+/// Batching lets a caller fetch several pieces of state in one RPC call and
+/// one contract invocation, amortising the fixed per-call overhead. Results
+/// are returned in the same order as the queries, so callers can match them
+/// positionally.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Query {
+    /// Fetch the full invoice for `invoice_id`.
+    GetInvoice(u64),
+    /// Fetch the current funded balance for `invoice_id`.
+    GetBalance(u64),
+    /// Fetch aggregate statistics for `invoice_id`.
+    GetStats(u64),
+}
+
+/// Issue #950: Result of a single [`Query`] in a batch.
+///
+/// Each variant mirrors the corresponding [`Query`] variant. A query that
+/// cannot be resolved (e.g. the invoice does not exist) yields `NotFound`
+/// rather than aborting the whole batch, so one bad query never discards the
+/// results of its neighbours.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryResult {
+    /// Result of [`Query::GetInvoice`].
+    Invoice(Invoice),
+    /// Result of [`Query::GetBalance`].
+    Balance(i128),
+    /// Result of [`Query::GetStats`].
+    Stats(InvoiceStats),
+    /// The queried invoice does not exist.
+    NotFound,
+}
+
 
 #[cfg(test)]
 mod tests {
