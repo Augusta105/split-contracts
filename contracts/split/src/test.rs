@@ -8688,3 +8688,481 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #937 — co-signer signature validation strengthening
+// ---------------------------------------------------------------------------
+
+/// Build a 32-byte signature payload from a single byte seed so tests can
+/// construct deterministic, distinct signatures without external crypto.
+fn sig_bytes(env: &Env, seed: u8) -> Bytes {
+    let mut arr = [0u8; 32];
+    arr[0] = seed;
+    arr[31] = seed.wrapping_mul(7);
+    Bytes::from_array(env, &arr)
+}
+
+/// Create an invoice that requires `threshold` of the supplied co-signers.
+fn make_multisig_invoice(
+    env: &Env,
+    c: &SplitContractClient,
+    creator: &Address,
+    recipient: &Address,
+    token_id: &Address,
+    co_signers: Vec<Address>,
+    threshold: u32,
+) -> u64 {
+    let mut recipients = Vec::new(env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(env);
+    amounts.push_back(100_i128);
+
+    let mut opts = default_options(env);
+    opts.co_signers = co_signers;
+    opts.required_signatures = threshold;
+
+    c.create_invoice(creator, &recipients, &amounts, token_id, &9_999_u64, &opts)
+}
+
+#[test]
+fn test_cosigner_valid_signatures_meet_threshold() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+    co_signers.push_back(s2.clone());
+    co_signers.push_back(s3.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 2);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    signers.push_back(s2.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 1));
+    sigs.push_back(sig_bytes(&env, 2));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_ok(), "valid 2-of-3 signatures must be accepted");
+}
+
+#[test]
+fn test_cosigner_below_threshold_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+    co_signers.push_back(s2.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 2);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 1));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_err(), "1-of-2 signatures must not satisfy a 2-of-2 threshold");
+}
+
+#[test]
+fn test_cosigner_non_cosigner_signer_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 1);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(outsider);
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 9));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_err(), "addresses not in the co-signer set must be rejected");
+}
+
+#[test]
+fn test_cosigner_empty_signature_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 1);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(Bytes::new(&env));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_err(), "empty signature payloads must be rejected");
+}
+
+#[test]
+fn test_cosigner_mismatched_lengths_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+    co_signers.push_back(s2.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 2);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    signers.push_back(s2.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 1));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_err(), "signer/signature length mismatch must be rejected");
+}
+
+#[test]
+fn test_cosigner_duplicate_signer_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+    co_signers.push_back(s2.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 2);
+
+    // Same signer twice must not count as two distinct approvals.
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    signers.push_back(s1.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 1));
+    sigs.push_back(sig_bytes(&env, 2));
+
+    let res = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(res.is_err(), "duplicate signers must not satisfy the threshold");
+}
+
+#[test]
+fn test_cosigner_replay_same_signature_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+
+    let id = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 1);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 5));
+
+    let first = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(first.is_ok(), "first submission must be accepted");
+
+    // Replaying the exact same signature must be rejected.
+    let replay = c.try_submit_cosigner_signatures(&id, &signers, &sigs);
+    assert!(replay.is_err(), "replayed signatures must be rejected");
+}
+
+#[test]
+fn test_cosigner_replay_across_invoices_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let s1 = Address::generate(&env);
+
+    let mut co_signers = Vec::new(&env);
+    co_signers.push_back(s1.clone());
+
+    let id1 = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers.clone(), 1);
+    let id2 = make_multisig_invoice(&env, &c, &creator, &recipient, &token_id, co_signers, 1);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(s1.clone());
+    let mut sigs = Vec::new(&env);
+    sigs.push_back(sig_bytes(&env, 7));
+
+    assert!(c.try_submit_cosigner_signatures(&id1, &signers, &sigs).is_ok());
+    // The same signature must not be reusable on a different invoice.
+    let res = c.try_submit_cosigner_signatures(&id2, &signers, &sigs);
+    assert!(res.is_err(), "signatures must be bound to a single invoice");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #938 — oracle address and condition validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_oracle_valid_address_and_condition_accepted() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+    let oracle = Address::generate(&env);
+
+    let mut opts = default_options(&env);
+    opts.condition_oracle = Some(oracle.clone());
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert!(id >= 1);
+
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(ext.condition_oracle, Some(oracle));
+}
+
+#[test]
+fn test_oracle_condition_evaluates_true() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+    let oracle = Address::generate(&env);
+
+    let mut opts = default_options(&env);
+    opts.condition_oracle = Some(oracle.clone());
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Oracle reports the condition as satisfied.
+    let res = c.try_check_oracle_condition(&id, &true);
+    assert!(res.is_ok());
+    assert!(res.unwrap(), "condition should evaluate to true");
+}
+
+#[test]
+fn test_oracle_condition_evaluates_false() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+    let oracle = Address::generate(&env);
+
+    let mut opts = default_options(&env);
+    opts.condition_oracle = Some(oracle);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    let res = c.try_check_oracle_condition(&id, &false);
+    assert!(res.is_ok());
+    assert!(!res.unwrap(), "condition should evaluate to false");
+}
+
+#[test]
+fn test_oracle_missing_address_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // No oracle configured; checking a condition must fail.
+    let mut opts = default_options(&env);
+    opts.condition_oracle = None;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    let res = c.try_check_oracle_condition(&id, &true);
+    assert!(res.is_err(), "condition check without an oracle must fail");
+}
+
+#[test]
+fn test_oracle_feed_returns_consistent_value() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+    let oracle = Address::generate(&env);
+
+    let mut opts = default_options(&env);
+    opts.condition_oracle = Some(oracle);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Repeated reads of the same feed must be stable.
+    let first = c.try_check_oracle_condition(&id, &true);
+    let second = c.try_check_oracle_condition(&id, &true);
+    assert_eq!(first, second);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #946 — recipient list caching
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recipient_cache_hit_returns_same_list() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    let first = c.get_recipient_invoice_ids(&recipient);
+    let second = c.get_recipient_invoice_ids(&recipient);
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first.get_unchecked(0), second.get_unchecked(0));
+    assert_eq!(second.get_unchecked(0), id);
+}
+
+#[test]
+fn test_recipient_cache_invalidated_after_new_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(c.get_recipient_invoice_ids(&recipient).len(), 1);
+
+    // Creating another invoice for the same recipient must invalidate the cache.
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let ids = c.get_recipient_invoice_ids(&recipient);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get_unchecked(0), id1);
+    assert_eq!(ids.get_unchecked(1), id2);
+}
+
+#[test]
+fn test_recipient_cache_invalidated_after_add_recipient() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    let id = make_invoice(&env, &c, &creator, &r1, 100, &token_id, 9_999);
+    assert_eq!(c.get_recipient_invoice_ids(&r2).len(), 0);
+
+    c.add_recipient(&creator, &id, &r2, &200_i128);
+
+    let r2_ids = c.get_recipient_invoice_ids(&r2);
+    assert_eq!(r2_ids.len(), 1);
+    assert_eq!(r2_ids.get_unchecked(0), id);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #951 — ContractError variant coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_error_invalid_amount_variant() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    let mut opts = default_options(&env);
+    opts.penalty_bps = Some(10_001);
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidAmount.into())));
+}
+
+#[test]
+fn test_error_invalid_ratio_sum_variant() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    let mut stages: Vec<u32> = Vec::new(&env);
+    stages.push_back(5_000u32);
+    stages.push_back(4_000u32);
+
+    let mut opts = default_options(&env);
+    opts.release_stages = stages;
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidRatioSum.into())));
+}
+
+#[test]
+fn test_error_variants_are_distinct() {
+    // Every newly added variant must map to a unique discriminant so that
+    // clients can reliably distinguish failure modes.
+    let variants = [
+        ContractError::InvalidAmount,
+        ContractError::InvalidRatioSum,
+        ContractError::InvoiceDeleted,
+        ContractError::FundsUnclaimed,
+        ContractError::NotDeleted,
+    ];
+    for i in 0..variants.len() {
+        for j in (i + 1)..variants.len() {
+            assert_ne!(
+                variants[i] as u32, variants[j] as u32,
+                "ContractError variants must not reuse codes"
+            );
+        }
+    }
+}
+
