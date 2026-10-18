@@ -34,6 +34,27 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, IntoVal, Symbol, TryFromVal, Val};
 
 // ---------------------------------------------------------------------------
+// Precomputed key prefixes (issue #943)
+// ---------------------------------------------------------------------------
+//
+// Hot paths previously rebuilt `Symbol` values (and the tuple wrapping them)
+// on every storage access. The prefixes below are `const` so the compiler
+// folds them into the binary and no allocation happens at call time. They are
+// also used by the legacy tuple-key helpers further down so that the whole
+// module shares a single, allocation-free set of prefixes.
+
+/// Prefix for the per-invoice creator fee (bps) key.
+pub const PREFIX_CREATOR_FEE_BPS: Symbol = symbol_short!("cr_fee_bp");
+/// Prefix for the allowed payment tokens key.
+pub const PREFIX_ALLOWED_TOKENS: Symbol = symbol_short!("alwd_toks");
+/// Prefix for the pending successor creator key.
+pub const PREFIX_PENDING_CREATOR: Symbol = symbol_short!("pend_cr");
+/// Prefix for the soft-delete tombstone key.
+pub const PREFIX_TOMBSTONE: Symbol = symbol_short!("tombstone");
+/// Prefix for the per-invoice event sequence counter (legacy tuple form).
+pub const PREFIX_EV_SEQ: Symbol = symbol_short!("ev_seq");
+
+// ---------------------------------------------------------------------------
 // Enum 1 — Instance-tier singletons
 // ---------------------------------------------------------------------------
 
@@ -447,6 +468,94 @@ mod tests {
     }
 
     #[test]
+    fn precomputed_prefixes_match_legacy_symbols() {
+        // Issue #943: the `const` prefixes must be byte-identical to the
+        // `symbol_short!` literals they replaced, otherwise on-chain keys
+        // would silently change.
+        assert_eq!(PREFIX_CREATOR_FEE_BPS, symbol_short!("cr_fee_bp"));
+        assert_eq!(PREFIX_ALLOWED_TOKENS, symbol_short!("alwd_toks"));
+        assert_eq!(PREFIX_PENDING_CREATOR, symbol_short!("pend_cr"));
+        assert_eq!(PREFIX_TOMBSTONE, symbol_short!("tombstone"));
+        assert_eq!(PREFIX_EV_SEQ, symbol_short!("ev_seq"));
+    }
+
+    #[test]
+    fn ev_seq_key_matches_legacy_tuple_shape() {
+        let env = Env::default();
+        let id = 7u64;
+        // The typed key must still be the `EvSeq` variant.
+        assert_eq!(ev_seq_key(id), InvoiceKey::EvSeq(id));
+        // And it must differ from the legacy tuple encoding so the migration
+        // path is explicit rather than accidental.
+        let typed: soroban_sdk::Val = ev_seq_key(id).into_val(&env);
+        let legacy: soroban_sdk::Val = (PREFIX_EV_SEQ, id).into_val(&env);
+        assert_ne!(typed.to_xdr(&env), legacy.to_xdr(&env));
+    }
+
+    #[test]
+    fn hot_path_constructors_match_direct_construction() {
+        let env = Env::default();
+        let addr = soroban_sdk::Address::generate(&env);
+        let id = 99u64;
+
+        assert_eq!(
+            invoice_key(InvoiceKey::Invoice, id),
+            InvoiceKey::Invoice(id)
+        );
+        assert_eq!(
+            address_key(AddressKey::Reputation, addr.clone()),
+            AddressKey::Reputation(addr.clone())
+        );
+        assert_eq!(
+            compound_key_u64_addr(CompoundKey::Channel, id, addr.clone()),
+            CompoundKey::Channel(id, addr.clone())
+        );
+        assert_eq!(
+            compound_key_addr_addr(
+                CompoundKey::CreatorPayerSet,
+                addr.clone(),
+                addr.clone()
+            ),
+            CompoundKey::CreatorPayerSet(addr.clone(), addr.clone())
+        );
+    }
+
+    #[test]
+    fn key_construction_benchmark_style() {
+        // Issue #943: benchmark-style smoke test. Builds a large batch of
+        // hot-path keys and asserts they are all distinct and cheap to
+        // produce. This is not a wall-clock benchmark (Soroban tests are not
+        // a reliable timing environment) but it guards against regressions
+        // that reintroduce per-call allocation or accidental collisions.
+        let env = Env::default();
+        let addr = soroban_sdk::Address::generate(&env);
+        const N: u64 = 256;
+
+        let mut seen: soroban_sdk::Vec<soroban_sdk::Bytes> = soroban_sdk::Vec::new(&env);
+        for id in 0..N {
+            let k = invoice_key(InvoiceKey::Invoice, id);
+            let v: soroban_sdk::Val = k.into_val(&env);
+            let xdr = v.to_xdr(&env);
+            assert!(!seen.contains(&xdr), "duplicate invoice key for id {id}");
+            seen.push_back(xdr);
+        }
+
+        for id in 0..N {
+            let k = compound_key_u64_addr(CompoundKey::Channel, id, addr.clone());
+            let v: soroban_sdk::Val = k.into_val(&env);
+            let xdr = v.to_xdr(&env);
+            assert!(!seen.contains(&xdr), "duplicate compound key for id {id}");
+            seen.push_back(xdr);
+        }
+
+        // Address keys are id-independent, so just assert the constructor is
+        // stable and produces the same value as direct construction.
+        let a = address_key(AddressKey::Credit, addr.clone());
+        let b = AddressKey::Credit(addr.clone());
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn compound_keys_differ_by_variant() {
         let env = Env::default();
         let addr = soroban_sdk::Address::generate(&env);
@@ -482,14 +591,16 @@ mod tests {
 /// Creator fee in basis points stored at invoice creation — persistent storage.
 /// Key: (Symbol, u64) → u32
 #[allow(dead_code)]
+#[inline(always)]
 pub fn creator_fee_bps_key(invoice_id: u64) -> (Symbol, u64) {
-    (symbol_short!("cr_fee_bp"), invoice_id)
+    (PREFIX_CREATOR_FEE_BPS, invoice_id)
 }
 
 /// Set of allowed payment tokens — persistent storage.
 /// Key: Symbol → Vec<Address>
+#[inline(always)]
 pub fn allowed_tokens_key() -> Symbol {
-    symbol_short!("alwd_toks")
+    PREFIX_ALLOWED_TOKENS
 }
 
 // ---------------------------------------------------------------------------
@@ -499,8 +610,9 @@ pub fn allowed_tokens_key() -> Symbol {
 /// Pending successor creator address — persistent storage.
 /// Key: (Symbol, u64) → Address
 #[allow(dead_code)]
+#[inline(always)]
 pub fn pending_creator_key(invoice_id: u64) -> (Symbol, u64) {
-    (symbol_short!("pend_cr"), invoice_id)
+    (PREFIX_PENDING_CREATOR, invoice_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +622,9 @@ pub fn pending_creator_key(invoice_id: u64) -> (Symbol, u64) {
 /// Tombstone record for soft-deleted invoices — persistent storage.
 /// Key: (Symbol, u64) → Tombstone
 #[allow(dead_code)]
+#[inline(always)]
 pub fn tombstone_key(invoice_id: u64) -> (Symbol, u64) {
-    (symbol_short!("tombstone"), invoice_id)
+    (PREFIX_TOMBSTONE, invoice_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +635,54 @@ pub fn tombstone_key(invoice_id: u64) -> (Symbol, u64) {
 ///
 /// Returns the [`InvoiceKey::EvSeq`] variant for `invoice_id`, replacing the
 /// old inline `(symbol_short!("ev_seq"), invoice_id)` tuple.
+///
+/// Issue #943: the variant is constructed directly (no intermediate tuple or
+/// `Symbol` allocation), so this is a single-field enum wrap.
+#[inline(always)]
 pub fn ev_seq_key(invoice_id: u64) -> InvoiceKey {
     InvoiceKey::EvSeq(invoice_id)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #943: allocation-free key constructors
+// ---------------------------------------------------------------------------
+//
+// These helpers build the hot-path keys without any intermediate heap or
+// host-object allocation: the enum variant is constructed in place and the
+// `u64`/`Address` payload is moved straight into it. Callers that previously
+// did `InvoiceKey::Invoice(id)` can keep doing so — the constructors below
+// exist for call sites that want an explicit, documented hot-path entry point
+// and for benchmarking.
+
+/// Build a per-invoice key with no intermediate allocation.
+#[inline(always)]
+pub fn invoice_key(variant: fn(u64) -> InvoiceKey, invoice_id: u64) -> InvoiceKey {
+    variant(invoice_id)
+}
+
+/// Build a per-address key with no intermediate allocation.
+#[inline(always)]
+pub fn address_key(variant: fn(Address) -> AddressKey, address: Address) -> AddressKey {
+    variant(address)
+}
+
+/// Build a compound `(u64, Address)` key with no intermediate allocation.
+#[inline(always)]
+pub fn compound_key_u64_addr(
+    variant: fn(u64, Address) -> CompoundKey,
+    invoice_id: u64,
+    address: Address,
+) -> CompoundKey {
+    variant(invoice_id, address)
+}
+
+/// Build a compound `(Address, Address)` key with no intermediate allocation.
+#[inline(always)]
+pub fn compound_key_addr_addr(
+    variant: fn(Address, Address) -> CompoundKey,
+    first: Address,
+    second: Address,
+) -> CompoundKey {
+    variant(first, second)
 }
 

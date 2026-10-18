@@ -1882,6 +1882,116 @@ pub struct PaymentRecord {
     pub ledger: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Issue #955: Fee event tracking
+// ---------------------------------------------------------------------------
+
+/// Issue #955: Discriminator identifying which fee a fee event refers to.
+///
+/// Each variant is emitted as its own event topic so that off-chain indexers
+/// can filter fee activity per fee type without decoding the payload.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeType {
+    /// The contract-wide platform fee.
+    Platform,
+    /// The per-invoice creator fee (`creator_fee_bps`).
+    Creator,
+    /// The protocol fee configured via `ProtocolFeeConfig`.
+    Protocol,
+    /// The insurance premium withheld for the insurance fund.
+    Insurance,
+}
+
+/// Issue #955: Emitted when a fee amount is calculated for an invoice.
+///
+/// `amount` is the fee actually withheld in token units; `basis_points` is the
+/// rate that produced it, so indexers can recompute and audit the result.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeCalculatedEvent {
+    /// Invoice the fee was calculated for.
+    pub invoice_id: u64,
+    /// Which fee this is.
+    pub fee_type: FeeType,
+    /// Fee amount withheld, in token units.
+    pub amount: i128,
+    /// Rate applied, in basis points (10 000 = 100%).
+    pub basis_points: u32,
+    /// Gross amount the fee was computed from.
+    pub base_amount: i128,
+    /// Ledger sequence at which the calculation happened.
+    pub ledger: u32,
+}
+
+/// Issue #955: Emitted when a calculated fee is distributed to its recipient.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeDistributedEvent {
+    /// Invoice the fee was distributed for.
+    pub invoice_id: u64,
+    /// Which fee this is.
+    pub fee_type: FeeType,
+    /// Address that received the fee.
+    pub recipient: Address,
+    /// Amount transferred, in token units.
+    pub amount: i128,
+    /// Token the fee was paid in.
+    pub token: Address,
+    /// Ledger sequence at which the distribution happened.
+    pub ledger: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #953: Detailed state-transition event logging
+// ---------------------------------------------------------------------------
+
+/// Issue #953: Emitted for every invoice state transition.
+///
+/// `from`/`to` are the status bytes (see [`InvoiceStatus::to_u8`]) so the
+/// payload stays compact and forward-compatible with new variants.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StateTransitionEvent {
+    /// Invoice whose state changed.
+    pub invoice_id: u64,
+    /// Status byte before the transition.
+    pub from: u32,
+    /// Status byte after the transition.
+    pub to: u32,
+    /// Address that triggered the transition.
+    pub actor: Address,
+    /// Ledger sequence at which the transition happened.
+    pub ledger: u32,
+    /// Ledger timestamp at which the transition happened.
+    pub timestamp: u64,
+    /// Optional human-readable reason tag (e.g. "release", "refund").
+    pub reason: Option<Symbol>,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #942: Lazy-loaded invoice extension cache
+// ---------------------------------------------------------------------------
+
+/// Issue #942: Cached copy of an invoice's extension data.
+///
+/// The extension (`InvoiceExt` / `InvoiceExt2`) is only loaded from storage
+/// when a code path actually needs it. Once loaded it is cached under this
+/// record so repeated accesses within the same invocation (and across
+/// invocations, subject to TTL) avoid re-reading and re-decoding the entry.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceExtCacheEntry {
+    /// Invoice the cached extension belongs to.
+    pub invoice_id: u64,
+    /// Cached extension data.
+    pub ext: InvoiceExt,
+    /// Cached overflow extension data.
+    pub ext2: InvoiceExt2,
+    /// Ledger sequence at which the cache entry was written.
+    pub cached_at_ledger: u32,
+}
+
 
 #[cfg(test)]
 mod tests {
