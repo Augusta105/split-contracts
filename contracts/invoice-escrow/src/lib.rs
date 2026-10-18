@@ -71,6 +71,10 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
 /// ~30 minutes at 5s ledger close time.
 const APPEAL_WINDOW_LEDGERS: u32 = 360;
 
+/// Maximum allowed deadline horizon for a new invoice, in seconds.
+/// 365 days — deadlines further in the future than this are rejected.
+const MAX_DEADLINE_HORIZON: u64 = 365 * 24 * 60 * 60;
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -94,6 +98,29 @@ fn get_invoice(env: &Env, id: u64) -> Result<EscrowInvoice, Error> {
 
 fn save_invoice(env: &Env, id: u64, invoice: &EscrowInvoice) {
     env.storage().persistent().set(&invoice_key(id), invoice);
+}
+
+/// Validate an invoice deadline against the current ledger timestamp.
+///
+/// # Rules
+/// * The deadline must be strictly in the future: `deadline > now`.
+///   A deadline equal to `now` is rejected as already expired.
+/// * The deadline must not exceed `now + MAX_DEADLINE_HORIZON`
+///   (365 days), bounding how far ahead an escrow can be opened.
+///
+/// # Errors
+/// * [`Error::DeadlinePassed`] — `deadline <= now`.
+/// * [`Error::DeadlineOutOfRange`] — `deadline > now + MAX_DEADLINE_HORIZON`.
+fn validate_deadline(env: &Env, deadline: u64) -> Result<(), Error> {
+    let now = env.ledger().timestamp();
+    if deadline <= now {
+        return Err(Error::DeadlinePassed);
+    }
+    let max_deadline = now.saturating_add(MAX_DEADLINE_HORIZON);
+    if deadline > max_deadline {
+        return Err(Error::DeadlineOutOfRange);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +355,9 @@ impl InvoiceEscrowContract {
     /// # Errors
     /// * [`Error::NotInitialized`]   — Contract not initialized.
     /// * [`Error::InvalidTotalAmount`] — `total_amount` ≤ 0.
+    /// * [`Error::DeadlinePassed`]   — `deadline` is not in the future.
+    /// * [`Error::DeadlineOutOfRange`] — `deadline` exceeds the maximum
+    ///   horizon of 365 days from the current ledger timestamp.
     pub fn create_invoice(
         env: Env,
         creator: Address,
@@ -341,6 +371,7 @@ impl InvoiceEscrowContract {
         if total_amount <= 0 {
             return Err(Error::InvalidTotalAmount);
         }
+        validate_deadline(&env, deadline)?;
         creator.require_auth();
 
         let id: u64 = env

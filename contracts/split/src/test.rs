@@ -8688,3 +8688,433 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #935 — platform fee cap validation
+//
+// The platform fee rate is expressed in basis points (bps) where 10_000 bps
+// equals 100%. The configured rate must never exceed `MAX_PLATFORM_FEE_BPS`
+// (10_000 bps = 100%). These tests pin the boundary behaviour: 0, cap - 1,
+// cap, cap + 1 and u32::MAX.
+// ---------------------------------------------------------------------------
+
+/// The documented upper bound for the platform fee rate, in basis points.
+const MAX_PLATFORM_FEE_BPS: u32 = 10_000;
+
+#[test]
+fn test_platform_fee_zero_is_valid() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // 0 bps is the lowest valid fee rate.
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    assert_eq!(c.get_fee_bps(), 0);
+}
+
+#[test]
+fn test_platform_fee_cap_minus_one_is_valid() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee = MAX_PLATFORM_FEE_BPS - 1;
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &fee, &None, &0_u32, &0_u32, &0_u64);
+    assert_eq!(c.get_fee_bps(), fee);
+}
+
+#[test]
+fn test_platform_fee_at_cap_is_valid() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Exactly at the cap (100%) must still be accepted.
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &MAX_PLATFORM_FEE_BPS, &None, &0_u32, &0_u32, &0_u64);
+    assert_eq!(c.get_fee_bps(), MAX_PLATFORM_FEE_BPS);
+}
+
+#[test]
+fn test_platform_fee_cap_plus_one_rejected() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let fee = MAX_PLATFORM_FEE_BPS + 1;
+    let res = c.try_initialize(
+        &admin, &0_i128, &treasury, &token_id, &fee, &None, &0_u32, &0_u32, &0_u64,
+    );
+    assert_eq!(res, Err(Ok(ContractError::InvalidFeeBps.into())));
+}
+
+#[test]
+fn test_platform_fee_u32_max_rejected() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let res = c.try_initialize(
+        &admin, &0_i128, &treasury, &token_id, &u32::MAX, &None, &0_u32, &0_u32, &0_u64,
+    );
+    assert_eq!(res, Err(Ok(ContractError::InvalidFeeBps.into())));
+}
+
+#[test]
+fn test_set_fee_bps_cap_plus_one_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    // Admin must be the initializer for the setter to be authorised.
+    let res = c.try_set_fee_bps(&admin, &(MAX_PLATFORM_FEE_BPS + 1));
+    assert_eq!(res, Err(Ok(ContractError::InvalidFeeBps.into())));
+}
+
+#[test]
+fn test_set_fee_bps_at_cap_ok() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    c.set_fee_bps(&admin, &MAX_PLATFORM_FEE_BPS);
+    assert_eq!(c.get_fee_bps(), MAX_PLATFORM_FEE_BPS);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #939 — split rule validation
+//
+// Split rules assign a share of the invoice to each recipient. Every rule's
+// `ratio_bps` must be in 0..=10_000 and, when rules are supplied, the ratios
+// must sum to exactly 10_000 bps (100%).
+// ---------------------------------------------------------------------------
+
+/// Build a `SplitRule` with the given ratio.
+fn split_rule(env: &Env, recipient: &Address, ratio_bps: u32) -> SplitRule {
+    SplitRule {
+        recipient: recipient.clone(),
+        ratio_bps,
+    }
+}
+
+#[test]
+fn test_split_rules_empty_is_valid() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // No split rules: the invoice uses the plain recipient/amount split.
+    let mut opts = default_options(&env);
+    opts.split_rules = Vec::new(&env);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert!(id >= 1);
+}
+
+#[test]
+fn test_split_rules_single_rule_full_ratio_ok() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 10_000));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert!(id >= 1);
+}
+
+#[test]
+fn test_split_rules_sum_below_total_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // 5_000 + 4_999 = 9_999, one bps short of the required total.
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 5_000));
+    rules.push_back(split_rule(&env, &recipients.get(1).unwrap(), 4_999));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidRatioSum.into())));
+}
+
+#[test]
+fn test_split_rules_sum_above_total_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // 5_000 + 5_001 = 10_001, one bps over the required total.
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 5_000));
+    rules.push_back(split_rule(&env, &recipients.get(1).unwrap(), 5_001));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidRatioSum.into())));
+}
+
+#[test]
+fn test_split_rules_sum_exact_total_ok() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 6_000));
+    rules.push_back(split_rule(&env, &recipients.get(1).unwrap(), 4_000));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert!(id >= 1);
+}
+
+#[test]
+fn test_split_rules_zero_ratio_rule_ok_when_sum_total() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // A zero-ratio rule is allowed as long as the total still sums to 10_000.
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 10_000));
+    rules.push_back(split_rule(&env, &recipients.get(1).unwrap(), 0));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert!(id >= 1);
+}
+
+#[test]
+fn test_split_rules_single_rule_over_max_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // A single rule above 10_000 bps exceeds the per-rule bound.
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), 10_001));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidRatioSum.into())));
+}
+
+#[test]
+fn test_split_rules_overflow_prone_sum_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let (recipients, amounts) = two_recipients(&env);
+
+    // Two u32::MAX ratios would overflow a naive u32 sum; validation must
+    // reject them without panicking.
+    let mut rules = Vec::new(&env);
+    rules.push_back(split_rule(&env, &recipients.get(0).unwrap(), u32::MAX));
+    rules.push_back(split_rule(&env, &recipients.get(1).unwrap(), u32::MAX));
+
+    let mut opts = default_options(&env);
+    opts.split_rules = rules;
+
+    let res = c.try_create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    assert_eq!(res, Err(Ok(ContractError::InvalidRatioSum.into())));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #940 — token contract validation (SEP-41 interface)
+//
+// The invoice token must implement the SEP-41 token interface. A compliant
+// token is accepted; a contract that does not expose the interface is
+// rejected with `InvalidTokenContract`.
+// ---------------------------------------------------------------------------
+
+/// Minimal SEP-41 compliant mock token.
+#[contract]
+struct MockSep41Token;
+
+#[contractimpl]
+impl MockSep41Token {
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        from.require_auth();
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("allow"), from, spender), &(amount, expiration_ledger));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&(symbol_short!("bal"), id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_bal = Self::balance(env.clone(), from.clone());
+        let to_bal = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("bal"), from), &(from_bal - amount));
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("bal"), to), &(to_bal + amount));
+    }
+
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        Self::transfer(env, from, to, amount);
+    }
+
+    pub fn burn(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        let bal = Self::balance(env.clone(), from.clone());
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("bal"), from), &(bal - amount));
+    }
+
+    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        spender.require_auth();
+        Self::burn(env, from, amount);
+    }
+
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn name(env: Env) -> String {
+        String::from_str(&env, "Mock SEP-41")
+    }
+
+    pub fn symbol(env: Env) -> String {
+        String::from_str(&env, "MSEP")
+    }
+}
+
+/// A contract that does not implement the SEP-41 interface at all.
+#[contract]
+struct MockNonCompliantToken;
+
+#[contractimpl]
+impl MockNonCompliantToken {
+    pub fn ping(_env: Env) -> u32 {
+        1
+    }
+}
+
+#[test]
+fn test_token_contract_sep41_compliant_accepted() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let sep41_id = env.register(MockSep41Token, ());
+
+    // A SEP-41 compliant token must pass validation at initialization.
+    c.initialize(&admin, &0_i128, &treasury, &sep41_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    assert_eq!(c.get_token(), sep41_id);
+}
+
+#[test]
+fn test_token_contract_sep41_methods_work() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let holder = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sep41_id = env.register(MockSep41Token, ());
+    c.initialize(&admin, &0_i128, &treasury, &sep41_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let token = MockSep41TokenClient::new(&env, &sep41_id);
+
+    // Exercise the interface methods the contract relies on.
+    assert_eq!(token.decimals(), 7);
+    assert_eq!(token.name(), String::from_str(&env, "Mock SEP-41"));
+    assert_eq!(token.symbol(), String::from_str(&env, "MSEP"));
+    assert_eq!(token.balance(&holder), 0);
+
+    // Seed a balance directly and verify transfer semantics.
+    env.as_contract(&sep41_id, || {
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("bal"), holder.clone()), &1_000_i128);
+    });
+    token.transfer(&holder, &recipient, &400_i128);
+    assert_eq!(token.balance(&holder), 600);
+    assert_eq!(token.balance(&recipient), 400);
+}
+
+#[test]
+fn test_token_contract_non_compliant_rejected() {
+    let (env, contract_id, _token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let bad_token_id = env.register(MockNonCompliantToken, ());
+
+    // A contract missing the SEP-41 interface must be rejected.
+    let res = c.try_initialize(
+        &admin, &0_i128, &treasury, &bad_token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64,
+    );
+    assert_eq!(res, Err(Ok(ContractError::InvalidTokenContract.into())));
+}
+

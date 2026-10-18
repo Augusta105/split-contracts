@@ -46,4 +46,6 @@ pub enum Error {
     AlreadyFinalised = 18,
     /// Caller is not the blacklisted payer.
     NotBlacklistedPayer = 19,
+    /// The deadline is outside the permitted range (e.g. in the past or too far in the future).
+    DeadlineOutOfRange = 20,
 }

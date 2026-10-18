@@ -21,6 +21,7 @@ Full reference for all public entry points in the StellarSplit Soroban contract 
 - [Fee Management](#fee-management)
 - [Analytics](#analytics)
 - [Read Functions](#read-functions)
+- [Validation Rules](#validation-rules)
 
 ---
 
@@ -40,6 +41,8 @@ pub fn initialize(
 ```
 
 One-time setup. Sets the contract admin, USDC token address, treasury, platform fee basis points, and creation fee. Panics if called more than once.
+
+`platform_fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)); `usdc_token` must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)).
 
 ---
 
@@ -196,8 +199,8 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `creator` | `Address` | Invoice creator; must sign the transaction |
 | `recipients` | `Vec<Address>` | Ordered list of recipient addresses |
 | `amounts` | `Vec<i128>` | Amount owed to each recipient in token units; `amounts[i]` → `recipients[i]` |
-| `token` | `Address` | SAC token contract address (typically USDC) |
-| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded |
+| `token` | `Address` | SAC token contract address (typically USDC). Must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)) |
+| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded. Must be strictly greater than the current ledger timestamp and no more than `MAX_DEADLINE_HORIZON` seconds ahead (see [Validation Rules](#validation-rules)) |
 | `options` | `InvoiceOptions` | Extended options struct (see below) |
 
 **`InvoiceOptions` fields:**
@@ -231,7 +234,7 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `accepted_tokens` | `Vec<Address>` | Additional tokens accepted in `pay_with_token` |
 | `forward_to` | `Option<Address>` | Auto-forward leftover funds to this address |
 | `forward_invoice_id` | `Option<u64>` | Auto-forward leftover funds to another invoice |
-| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release |
+| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release. Must be non-empty when provided, each ratio must be in `(0, MAX_RATIO]`, and ratios must sum to exactly `10_000` bps (see [Validation Rules](#validation-rules)) |
 | `auto_resolve_rules` | `Vec<ResolveRule>` | Pre-agreed auto-resolution rules evaluated when `auto_resolve` is called |
 | `oracle_address` | `Option<Address>` | Oracle that must confirm a condition before release |
 | `cross_chain_ref` | `Option<String>` | Cross-chain reference identifier |
@@ -785,7 +788,7 @@ Returns the current creation fee.
 pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>)
 ```
 
-Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers.
+Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers. Each `fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)).
 
 ### `get_fee_tiers`
 
@@ -960,6 +963,80 @@ Returns the linked dashboard contract address, if configured.
 ### `is_paused`
 
 See [Pause & Circuit Breaker](#pause--circuit-breaker).
+
+---
+
+## Validation Rules
+
+The contract enforces the following invariants at the entry points listed. Violations panic and abort the transaction; no partial state is written.
+
+### Deadline window
+
+Applies to `create_invoice`, `create_batch`, `create_invoices_batch`, `clone_invoice` (when the deadline is overridden), and `create_subscription`.
+
+| Rule | Condition | Rationale |
+|------|-----------|-----------|
+| Future deadline | `deadline > env.ledger().timestamp()` | A deadline in the past would make the invoice immediately refundable and bypass the funding window |
+| Bounded horizon | `deadline <= env.ledger().timestamp() + MAX_DEADLINE_HORIZON` | Prevents absurd timestamps (e.g. `u64::MAX`) that break refund/reminder scheduling and analytics |
+
+`MAX_DEADLINE_HORIZON` is a contract constant expressed in seconds. The check is performed against the **current ledger timestamp**, not the client clock, so clients must account for ledger drift when computing deadlines near the boundary.
+
+Boundary behavior:
+
+- `deadline == now` → rejected (must be strictly in the future)
+- `deadline == now + MAX_DEADLINE_HORIZON` → accepted (inclusive upper bound)
+- `deadline == now + MAX_DEADLINE_HORIZON + 1` → rejected
+
+### Platform fee cap
+
+Applies to `initialize` and `set_fee_tiers`.
+
+| Rule | Condition | Rationale |
+|------|-----------|-----------|
+| Global cap | `platform_fee_bps <= MAX_PLATFORM_FEE_BPS` | Prevents misconfiguration that would confiscate an unreasonable share of released funds |
+| Tier cap | `tier.fee_bps <= MAX_PLATFORM_FEE_BPS` for every tier | Tiered fees must never exceed the global ceiling |
+
+`MAX_PLATFORM_FEE_BPS` is a contract constant in basis points (1 bps = 0.01%). The cap is inclusive: a value exactly equal to `MAX_PLATFORM_FEE_BPS` is accepted, one bps above is rejected. Fee waivers (`add_platform_fee_waiver`) reduce the effective fee to 0 and are unaffected by the cap.
+
+### Split rules
+
+Applies to `create_invoice` and any path that accepts `InvoiceOptions` with `split_rules`.
+
+| Rule | Condition | Rationale |
+|------|-----------|-----------|
+| Non-empty | `!split_rules.is_empty()` when the field is provided | An empty rule set is ambiguous; omit the field instead |
+| Positive ratio | `rule.ratio > 0` for every rule | Zero-share rules are dead weight and likely a mistake |
+| Per-rule bound | `rule.ratio <= MAX_RATIO` for every rule | Prevents a single rule from monopolizing the split |
+| Exact total | `sum(rule.ratio) == 10_000` | Basis points must fully allocate the payout; under- or over-allocation is rejected |
+
+Boundary behavior:
+
+- A single rule with `ratio == 10_000` is valid (full allocation to one recipient)
+- `ratio == 0` → rejected
+- `ratio == MAX_RATIO` → accepted; `MAX_RATIO + 1` → rejected
+- Sum of `9_999` or `10_001` → rejected
+
+### Token contract validation
+
+Applies to `initialize` (`usdc_token`), `create_invoice` (`token`), and `pay_with_token` (each entry of `accepted_tokens`).
+
+The token address must be a deployed contract implementing the [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token interface. The contract verifies the interface by invoking the following methods:
+
+| Method | Signature | Behavior checked |
+|--------|-----------|------------------|
+| `allowance` | `(from: Address, spender: Address) -> i128` | Must return a value without trapping |
+| `approve` | `(from: Address, spender: Address, amount: i128, expiration_ledger: u32)` | Must be callable; used for pull-payment flows |
+| `balance` | `(id: Address) -> i128` | Must return the balance of the queried address |
+| `transfer` | `(from: Address, to: Address, amount: i128)` | Used for all payouts and refunds |
+| `transfer_from` | `(spender: Address, from: Address, to: Address, amount: i128)` | Used when the contract pulls funds |
+| `decimals` | `() -> u32` | Must return a value; used for display and oracle conversions |
+
+Notes:
+
+- The contract does **not** require the optional SEP-41 metadata methods (`name`, `symbol`); tokens lacking them are still supported.
+- Tokens that trap on any of the required methods are rejected at validation time.
+- Stellar Asset Contracts (SACs) are always compatible and are the recommended token type.
+- Validation is performed once at configuration/creation time; a token contract that is upgraded to a non-conforming implementation after validation is not re-checked.
 
 ---
 

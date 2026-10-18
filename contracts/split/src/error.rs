@@ -145,4 +145,9 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #935: The configured platform fee rate exceeds `MAX_PLATFORM_FEE_BPS`.
+    PlatformFeeExceedsCap = 67,
+    /// Issue #940: The supplied token contract does not implement the required
+    /// SEP-41 interface (missing or misbehaving methods).
+    InvalidTokenContract = 68,
 }
