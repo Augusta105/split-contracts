@@ -113,6 +113,53 @@ pub fn assert_valid_bps(bps: u32) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Issue #936: Total number of shards an invoice's data is partitioned into.
+///
+/// Valid shard indices are `0..SHARD_COUNT` (inclusive lower, exclusive upper).
+pub const SHARD_COUNT: u64 = 256;
+
+/// Issue #936: Validate that a shard index lies within all applicable bounds.
+///
+/// A shard index must satisfy *all* of the following:
+/// - `shard_id < SHARD_COUNT` (the fixed shard-space limit, 256),
+/// - `shard_id < invoice_count` (there must be an invoice at that index),
+/// - `shard_id < data_len` (there must be data at that index).
+///
+/// # Errors
+/// Returns `Err(ContractError::InvalidShardIndex)` when any bound is exceeded.
+///
+/// # Examples
+/// ```ignore
+/// assert!(assert_shard_index_bounds(0, 10, 10).is_ok());
+/// assert!(assert_shard_index_bounds(10, 10, 10).is_err()); // == invoice_count
+/// assert!(assert_shard_index_bounds(256, 1_000, 1_000).is_err()); // >= SHARD_COUNT
+/// ```
+pub fn assert_shard_index_bounds(
+    shard_id: u64,
+    invoice_count: u64,
+    data_len: u64,
+) -> Result<(), ContractError> {
+    if shard_id >= SHARD_COUNT || shard_id >= invoice_count || shard_id >= data_len {
+        return Err(ContractError::InvalidShardIndex);
+    }
+    Ok(())
+}
+
+/// Issue #936: Validate a shard count against the fixed shard-space limit.
+///
+/// A count of zero is rejected (an invoice must have at least one shard) and
+/// any count above [`SHARD_COUNT`] is rejected.
+///
+/// # Errors
+/// Returns `Err(ContractError::InvalidShardIndex)` when `count == 0` or
+/// `count > SHARD_COUNT`.
+pub fn assert_shard_count(count: u64) -> Result<(), ContractError> {
+    if count == 0 || count > SHARD_COUNT {
+        return Err(ContractError::InvalidShardIndex);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +261,95 @@ mod tests {
         assert_eq!(
             assert_bps_sum(&[]),
             Err(ContractError::InvalidRatioSum)
+        );
+    }
+
+    // --- assert_shard_index_bounds / assert_shard_count (issue #936) ---
+
+    #[test]
+    fn shard_index_zero_passes() {
+        assert!(assert_shard_index_bounds(0, 1, 1).is_ok());
+        assert!(assert_shard_index_bounds(0, 10, 10).is_ok());
+    }
+
+    #[test]
+    fn shard_index_max_valid_passes() {
+        // Highest index that is still below every bound.
+        assert!(assert_shard_index_bounds(SHARD_COUNT - 1, SHARD_COUNT, SHARD_COUNT).is_ok());
+        assert!(assert_shard_index_bounds(9, 10, 10).is_ok());
+    }
+
+    #[test]
+    fn shard_index_at_invoice_count_rejected() {
+        assert_eq!(
+            assert_shard_index_bounds(10, 10, 100),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_index_at_data_len_rejected() {
+        assert_eq!(
+            assert_shard_index_bounds(10, 100, 10),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_index_at_shard_count_rejected() {
+        assert_eq!(
+            assert_shard_index_bounds(SHARD_COUNT, u64::MAX, u64::MAX),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_index_overflow_rejected() {
+        assert_eq!(
+            assert_shard_index_bounds(u64::MAX, u64::MAX, u64::MAX),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_index_with_zero_bounds_rejected() {
+        assert_eq!(
+            assert_shard_index_bounds(0, 0, 0),
+            Err(ContractError::InvalidShardIndex)
+        );
+        assert_eq!(
+            assert_shard_index_bounds(0, 0, 10),
+            Err(ContractError::InvalidShardIndex)
+        );
+        assert_eq!(
+            assert_shard_index_bounds(0, 10, 0),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_count_valid_passes() {
+        assert!(assert_shard_count(1).is_ok());
+        assert!(assert_shard_count(SHARD_COUNT).is_ok());
+    }
+
+    #[test]
+    fn shard_count_zero_rejected() {
+        assert_eq!(
+            assert_shard_count(0),
+            Err(ContractError::InvalidShardIndex)
+        );
+    }
+
+    #[test]
+    fn shard_count_above_limit_rejected() {
+        assert_eq!(
+            assert_shard_count(SHARD_COUNT + 1),
+            Err(ContractError::InvalidShardIndex)
+        );
+        assert_eq!(
+            assert_shard_count(u64::MAX),
+            Err(ContractError::InvalidShardIndex)
         );
     }
 }

@@ -216,6 +216,14 @@ pub enum InvoiceKey {
     /// Per-invoice event sequence counter — typed replacement for the former
     /// `(symbol_short!("ev_seq"), invoice_id)` inline key (issue #708).
     EvSeq(u64),
+    /// Issue #944: Cursor-based pagination state for invoice list queries.
+    ///
+    /// Key shape: `InvoiceListCursor(cursor_id)` where `cursor_id` is a
+    /// caller-supplied opaque identifier (e.g. a hash of the query filters).
+    /// Value: `(last_invoice_id: u64, last_created_ledger: u32)` — the sort
+    /// key of the last row returned, so the next page can resume with a
+    /// single persistent read instead of re-scanning from the start.
+    InvoiceListCursor(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +283,51 @@ pub enum CompoundKey {
     Template(Address, Symbol),
     TemplateVersion(Address, Symbol, u32),
     TemplateVersionCount(Address, Symbol),
+}
+
+// ---------------------------------------------------------------------------
+// Issue #945: Payment shard key helpers
+// ---------------------------------------------------------------------------
+
+/// Number of payment shards per invoice.
+///
+/// Shard allocation is deterministic: shard index for a payment is
+/// `payment_index % PAYMENT_SHARD_COUNT`, so a given payment always lands in
+/// the same shard and reads never need to probe more than one shard.
+pub const PAYMENT_SHARD_COUNT: u64 = 8;
+
+/// Returns the [`InvoiceKey::PaymentShard`] key for `(invoice_id, shard)`.
+///
+/// Layout: `PaymentShard(invoice_id, shard)` → `Vec<PaymentRecord>`.
+/// `shard` must be `< PAYMENT_SHARD_COUNT`; callers should derive it via
+/// [`payment_shard_index`] rather than picking a shard directly.
+#[inline]
+pub fn payment_shard_key(invoice_id: u64, shard: u64) -> InvoiceKey {
+    InvoiceKey::PaymentShard(invoice_id, shard)
+}
+
+/// Maps a payment's position within an invoice to its shard index.
+///
+/// Deterministic and allocation-free: `payment_index % PAYMENT_SHARD_COUNT`.
+#[inline]
+pub fn payment_shard_index(payment_index: u64) -> u64 {
+    payment_index % PAYMENT_SHARD_COUNT
+}
+
+/// Convenience: key for the shard that holds `payment_index` of `invoice_id`.
+#[inline]
+pub fn payment_shard_key_for(invoice_id: u64, payment_index: u64) -> InvoiceKey {
+    payment_shard_key(invoice_id, payment_shard_index(payment_index))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #944: Pagination cursor key helper
+// ---------------------------------------------------------------------------
+
+/// Returns the [`InvoiceKey::InvoiceListCursor`] key for `cursor_id`.
+#[inline]
+pub fn invoice_list_cursor_key(cursor_id: u64) -> InvoiceKey {
+    InvoiceKey::InvoiceListCursor(cursor_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +442,7 @@ mod tests {
             InvoiceKey::RecipientsList(id), InvoiceKey::AmountsList(id),
             InvoiceKey::PaidFlags(id), InvoiceKey::MilestoneFlags(id),
             InvoiceKey::ArchiveMarker(id), InvoiceKey::CreatedLedger(id),
-            InvoiceKey::EvSeq(id),
+            InvoiceKey::EvSeq(id), InvoiceKey::InvoiceListCursor(id),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -412,6 +465,34 @@ mod tests {
         assert_ne!(
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 0)),
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 1))
+        );
+    }
+
+    #[test]
+    fn payment_shard_index_is_deterministic_and_bounded() {
+        for i in 0..(PAYMENT_SHARD_COUNT * 3) {
+            let shard = payment_shard_index(i);
+            assert!(shard < PAYMENT_SHARD_COUNT);
+            assert_eq!(shard, payment_shard_index(i));
+            assert_eq!(shard, i % PAYMENT_SHARD_COUNT);
+        }
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &payment_shard_key_for(7, 3)),
+            xdr_ik(&env, &payment_shard_key(7, 3))
+        );
+    }
+
+    #[test]
+    fn invoice_list_cursor_key_is_distinct() {
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &InvoiceKey::InvoiceListCursor(5))
+        );
+        assert_ne!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &invoice_list_cursor_key(6))
         );
     }
 

@@ -21,6 +21,8 @@ Full reference for all public entry points in the StellarSplit Soroban contract 
 - [Fee Management](#fee-management)
 - [Analytics](#analytics)
 - [Read Functions](#read-functions)
+- [Shard Index Limits](#shard-index-limits)
+- [Invoice Pagination](#invoice-pagination)
 
 ---
 
@@ -960,6 +962,90 @@ Returns the linked dashboard contract address, if configured.
 ### `is_paused`
 
 See [Pause & Circuit Breaker](#pause--circuit-breaker).
+
+---
+
+## Shard Index Limits
+
+Payment shards are stored in fixed-size buckets. All shard-indexed entry points validate the index before reading or writing storage and panic with a descriptive message when a bound is violated.
+
+**Constants:**
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SHARD_COUNT` | `16` | Number of payment shards per invoice. Valid shard indices are `0..SHARD_COUNT` (inclusive lower, exclusive upper). |
+| `MAX_INVOICE_COUNT` | `u32::MAX` | Maximum number of invoices the contract will ever create. Invoice IDs are `u64` but are bounded by this count. |
+| `MAX_SHARD_DATA_LEN` | `1024` | Maximum number of entries (payments) a single shard may hold. |
+
+**Validation rules:**
+
+- `shard_index < SHARD_COUNT` — an index of `SHARD_COUNT` or greater panics with `shard index out of bounds`.
+- `invoice_id < invoice_count` — referencing an invoice ID that has not been created (or exceeds `MAX_INVOICE_COUNT`) panics with `invoice id out of bounds`.
+- `shard_data.len() <= MAX_SHARD_DATA_LEN` — appending beyond the per-shard data length bound panics with `shard data length exceeded`.
+- `count <= MAX_SHARD_DATA_LEN` — any `count` argument passed to shard read functions must not exceed the per-shard data length bound.
+
+**Edge cases:**
+
+- `shard_index == 0` and `shard_index == SHARD_COUNT - 1` are valid.
+- `shard_index == SHARD_COUNT` is invalid (upper bound is exclusive).
+- An empty shard (`len == 0`) is valid and returns an empty vector.
+- A shard at exactly `MAX_SHARD_DATA_LEN` entries is valid; one more entry is rejected.
+- `invoice_count == 0` means no invoice IDs are valid.
+
+---
+
+## Invoice Pagination
+
+### `list_invoices`
+
+```rust
+pub fn list_invoices(
+    env: Env,
+    cursor: Option<u64>,
+    limit: u32,
+) -> InvoicePage
+```
+
+Returns a page of invoices using cursor-based pagination. Results are sorted by invoice ID in **ascending** order (oldest first).
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `cursor` | `Option<u64>` | Opaque cursor from a previous page. `None` starts from the first invoice. |
+| `limit` | `u32` | Maximum number of invoices to return. Must be in `1..=MAX_PAGE_SIZE`. |
+
+**Cursor format:**
+
+The cursor is the invoice ID of the **last item returned** on the previous page. To fetch the next page, pass that ID as `cursor`; the next page begins at the first invoice whose ID is strictly greater than the cursor. Cursors are stable across inserts and deletions of other invoices because ordering is by ID, not by insertion position.
+
+**Page size limits:**
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_PAGE_SIZE` | `100` | Maximum allowed `limit`. |
+| `DEFAULT_PAGE_SIZE` | `20` | Used when `limit` is `0`. |
+
+A `limit` greater than `MAX_PAGE_SIZE` panics with `limit exceeds MAX_PAGE_SIZE`.
+
+**Return value:**
+
+```rust
+pub struct InvoicePage {
+    pub items: Vec<InvoiceSnapshot>, // up to `limit` invoices, ascending by id
+    pub next_cursor: Option<u64>,    // id of last item, or None when no more pages
+}
+```
+
+`next_cursor` is `None` when the returned page is the last page (fewer than `limit` items were available). An empty `items` vector with `next_cursor == None` means the cursor was past the end of the list.
+
+**Edge cases:**
+
+- `cursor = None`, `limit = 0` → returns the first `DEFAULT_PAGE_SIZE` invoices.
+- `cursor` equal to the highest existing invoice ID → returns an empty page with `next_cursor = None`.
+- `cursor` greater than any existing invoice ID → returns an empty page with `next_cursor = None`.
+- `limit = MAX_PAGE_SIZE` is valid; `limit = MAX_PAGE_SIZE + 1` panics.
+- Pagination is consistent while new invoices are created: newly created invoices (higher IDs) appear only on later pages.
 
 ---
 

@@ -1882,6 +1882,63 @@ pub struct PaymentRecord {
     pub ledger: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Issue #944: Cursor-based pagination for invoice listings
+// ---------------------------------------------------------------------------
+
+/// Issue #944: Deterministic sort order for paginated invoice listings.
+///
+/// Every ordering is a *total* order: ties on the primary key are broken by
+/// the invoice id, so a cursor always resumes at exactly the right position
+/// and no invoice is skipped or returned twice.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum InvoiceSortOrder {
+    /// Ascending invoice id (creation order).
+    IdAsc,
+    /// Descending invoice id (newest first).
+    IdDesc,
+    /// Ascending deadline; ties broken by ascending id.
+    DeadlineAsc,
+    /// Descending deadline; ties broken by ascending id.
+    DeadlineDesc,
+    /// Ascending funded amount; ties broken by ascending id.
+    FundedAsc,
+    /// Descending funded amount; ties broken by ascending id.
+    FundedDesc,
+}
+
+/// Issue #944: Opaque position marker for cursor-based invoice pagination.
+///
+/// The cursor records the sort order it was produced under plus the primary
+/// sort key and invoice id of the last item returned. Passing it back to the
+/// list entry point resumes the listing immediately after that item. A cursor
+/// whose `sort` differs from the requested order is rejected by the contract.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvoiceCursor {
+    /// The sort order this cursor was produced under.
+    pub sort: InvoiceSortOrder,
+    /// Invoice id of the last item returned in the previous page.
+    pub last_seen_id: u64,
+    /// Primary sort key of the last item returned (deadline or funded total,
+    /// depending on `sort`; unused for the id-based orders).
+    pub last_seen_key: i128,
+}
+
+/// Issue #944: A single page of invoices plus the cursor for the next page.
+///
+/// `next_cursor` is `None` when the returned page is the last one, so callers
+/// can stop paging without an extra empty request.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaginatedInvoices {
+    /// Invoice ids in this page, already ordered by the requested sort.
+    pub items: Vec<u64>,
+    /// Cursor to pass to the next call, or `None` if this is the last page.
+    pub next_cursor: Option<InvoiceCursor>,
+}
+
 
 #[cfg(test)]
 mod tests {

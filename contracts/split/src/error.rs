@@ -145,4 +145,7 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #936: A shard index is out of bounds — it must be less than the
+    /// invoice count and within the stored shard data range.
+    ShardIndexOutOfBounds = 67,
 }

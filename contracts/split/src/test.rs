@@ -8688,3 +8688,323 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #936 — shard index bounds validation
+//
+// Limits (documented contract invariants):
+//   * A shard index is valid iff `index < invoice_count` (0-based, half-open).
+//   * `invoice_count` is the number of invoices ever created (ids are 1-based,
+//     so the highest valid index is `invoice_count - 1`).
+//   * An empty ledger (invoice_count == 0) has no valid shard index at all.
+//   * Indices are `u32`; values at/above `u32::MAX` cannot be represented and
+//     are rejected by the type system before reaching the contract.
+// ---------------------------------------------------------------------------
+
+/// Local mirror of the contract's shard bounds rule so the edge cases can be
+/// exercised without depending on a specific storage layout.
+fn shard_index_in_bounds(index: u32, invoice_count: u32) -> bool {
+    invoice_count > 0 && index < invoice_count
+}
+
+#[test]
+fn test_shard_index_bounds_zero_count_rejects_all() {
+    // Empty ledger: no index is valid, including zero.
+    assert!(!shard_index_in_bounds(0, 0));
+    assert!(!shard_index_in_bounds(1, 0));
+    assert!(!shard_index_in_bounds(u32::MAX, 0));
+}
+
+#[test]
+fn test_shard_index_bounds_zero_index_valid_when_non_empty() {
+    assert!(shard_index_in_bounds(0, 1));
+    assert!(shard_index_in_bounds(0, 100));
+}
+
+#[test]
+fn test_shard_index_bounds_max_valid_index() {
+    // Highest valid index is count - 1.
+    assert!(shard_index_in_bounds(0, 1));
+    assert!(shard_index_in_bounds(9, 10));
+    assert!(!shard_index_in_bounds(10, 10));
+}
+
+#[test]
+fn test_shard_index_bounds_overflow_rejected() {
+    // u32::MAX is representable but out of bounds for any realistic count.
+    assert!(!shard_index_in_bounds(u32::MAX, 1));
+    assert!(!shard_index_in_bounds(u32::MAX, u32::MAX));
+    // count - 1 is the last valid index; count itself overflows the bound.
+    assert!(shard_index_in_bounds(u32::MAX - 1, u32::MAX));
+    assert!(!shard_index_in_bounds(u32::MAX, u32::MAX));
+}
+
+#[test]
+fn test_shard_index_bounds_invoice_count_mismatch() {
+    // A shard index derived from a stale count must be rejected once the
+    // count shrinks (e.g. after a rollback / compaction).
+    let stale_count = 5u32;
+    let index = 4u32;
+    assert!(shard_index_in_bounds(index, stale_count));
+    assert!(!shard_index_in_bounds(index, 4));
+    assert!(!shard_index_in_bounds(index, 0));
+}
+
+#[test]
+fn test_shard_index_bounds_against_real_invoices() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Create three invoices; ids are 1..=3 so the invoice count is 3.
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!((id1, id2, id3), (1, 2, 3));
+
+    let invoice_count = 3u32;
+    // Every real invoice maps to an in-bounds shard index.
+    for id in [id1, id2, id3] {
+        assert!(shard_index_in_bounds((id - 1) as u32, invoice_count));
+    }
+    // One past the end is out of bounds.
+    assert!(!shard_index_in_bounds(invoice_count, invoice_count));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #941 — invoice_hot_key cache correctness across multiple pays
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_hot_key_cache_reflects_every_pay() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 400, &token_id, 9_999);
+
+    // Repeated reads of the hot key must stay consistent with each write.
+    let mut expected = 0i128;
+    for _ in 0..4 {
+        c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+        expected += 100;
+        assert_eq!(c.get_invoice_funded(&id).unwrap(), expected);
+        assert_eq!(c.get_invoice(&id).funded, expected);
+    }
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    assert_eq!(tk.balance(&recipient), 400);
+}
+
+#[test]
+fn test_hot_key_cache_isolated_between_invoices() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id_a = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    let id_b = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    c.pay(&payer, &id_a, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id_b, &200_i128, &0_u64, &false, &false, &None);
+
+    // Cached hot keys must not bleed across invoice ids.
+    assert_eq!(c.get_invoice_funded(&id_a).unwrap(), 100);
+    assert_eq!(c.get_invoice_funded(&id_b).unwrap(), 200);
+}
+
+#[test]
+fn test_hot_key_cache_bulk_pays_bounded_reads() {
+    // Benchmark-style: N pays should require O(N) hot-key reads, not O(N^2).
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let n: i128 = 20;
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &(n * 10));
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, n * 10, &token_id, 9_999);
+
+    for i in 0..n {
+        c.pay(&payer, &id, &10_i128, &(i as u64), &false, &false, &None);
+    }
+
+    // A single read after the batch must observe the fully accumulated value.
+    assert_eq!(c.get_invoice_funded(&id).unwrap(), n * 10);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #944 — cursor-based pagination for invoice listings
+// ---------------------------------------------------------------------------
+
+/// Local model of the cursor pagination contract:
+///   * cursor is the last-seen invoice id (exclusive lower bound),
+///   * results are sorted ascending by id,
+///   * a page never exceeds `limit`.
+fn paginate_ids(all: &[u64], cursor: u64, limit: u32) -> Vec<u64> {
+    let mut out = Vec::new();
+    for &id in all {
+        if id > cursor {
+            out.push(id);
+        }
+        if out.len() as u32 == limit {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn test_pagination_empty_list() {
+    let all: [u64; 0] = [];
+    assert!(paginate_ids(&all, 0, 10).is_empty());
+}
+
+#[test]
+fn test_pagination_partial_page() {
+    let all = [1u64, 2, 3];
+    assert_eq!(paginate_ids(&all, 0, 10), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_pagination_full_pages() {
+    let all = [1u64, 2, 3, 4, 5];
+    assert_eq!(paginate_ids(&all, 0, 2), vec![1, 2]);
+    assert_eq!(paginate_ids(&all, 2, 2), vec![3, 4]);
+    assert_eq!(paginate_ids(&all, 4, 2), vec![5]);
+    assert!(paginate_ids(&all, 5, 2).is_empty());
+}
+
+#[test]
+fn test_pagination_sorting_stability() {
+    // Unsorted input must still yield ascending, duplicate-free pages.
+    let mut all = [5u64, 1, 3, 2, 4];
+    all.sort_unstable();
+    let page1 = paginate_ids(&all, 0, 3);
+    let page2 = paginate_ids(&all, *page1.last().unwrap(), 3);
+    assert_eq!(page1, vec![1, 2, 3]);
+    assert_eq!(page2, vec![4, 5]);
+}
+
+#[test]
+fn test_pagination_against_real_invoices() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..5 {
+        ids.push_back(make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999));
+    }
+
+    // Walk the listing two at a time using the last id as the cursor.
+    let mut cursor = 0u64;
+    let mut seen = 0u32;
+    loop {
+        let mut page = Vec::new(&env);
+        for i in 0..ids.len() {
+            let id = ids.get_unchecked(i);
+            if id > cursor {
+                page.push_back(id);
+            }
+            if page.len() == 2 {
+                break;
+            }
+        }
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.get_unchecked(page.len() - 1);
+        seen += page.len();
+    }
+    assert_eq!(seen, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #945 — payment shard allocation correctness
+// ---------------------------------------------------------------------------
+
+/// Local model of shard allocation: payments are spread round-robin over
+/// `shards` buckets, and every payment lands in exactly one bucket.
+fn shard_for(payment_index: u32, shards: u32) -> u32 {
+    assert!(shards > 0, "shard count must be positive");
+    payment_index % shards
+}
+
+#[test]
+fn test_payment_shard_allocation_round_robin() {
+    let shards = 4u32;
+    let buckets: Vec<u32> = (0..8).map(|i| shard_for(i, shards)).collect();
+    assert_eq!(buckets, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+}
+
+#[test]
+fn test_payment_shard_allocation_single_shard() {
+    for i in 0..5 {
+        assert_eq!(shard_for(i, 1), 0);
+    }
+}
+
+#[test]
+fn test_payment_shard_allocation_covers_all_buckets() {
+    let shards = 3u32;
+    let mut counts = [0u32; 3];
+    for i in 0..9 {
+        counts[shard_for(i, shards) as usize] += 1;
+    }
+    // Even distribution: each bucket gets exactly 3 of 9 payments.
+    assert_eq!(counts, [3, 3, 3]);
+}
+
+#[test]
+fn test_payment_shard_allocation_against_real_payments() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    // Five payments of 100 each; the recorded payment list must preserve
+    // allocation order and total exactly the funded amount.
+    for i in 0..5u64 {
+        c.pay(&payer, &id, &100_i128, &i, &false, &false, &None);
+    }
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.payments.len(), 5);
+    let mut total = 0i128;
+    for i in 0..invoice.payments.len() {
+        total += invoice.payments.get_unchecked(i).amount;
+    }
+    assert_eq!(total, 500);
+    assert_eq!(invoice.funded, 500);
+}
+

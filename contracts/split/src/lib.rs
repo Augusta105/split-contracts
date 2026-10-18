@@ -11624,20 +11624,8 @@ impl SplitContract {
         }
 
         // No bids were placed; refund payers as normal.
-        // Aggregate payments from all shards (issue #177).
-        let mut totals: Map<Address, i128> = Map::new(&env);
-        for shard_id in 0..SHARD_COUNT {
-            if let Some(shard_payments) = env
-                .storage()
-                .persistent()
-                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
-            {
-                for payment in shard_payments.iter() {
-                    let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-                    totals.set(payment.payer.clone(), prev + payment.amount);
-                }
-            }
-        }
+        // Aggregate payments from all shards (issue #177, #945).
+        let totals = aggregate_shard_payments(&env, invoice_id);
 
         let mut total_refunded_amount: i128 = 0;
         for (payer, amount) in totals.iter() {
@@ -11743,20 +11731,8 @@ impl SplitContract {
             // Refund all payments.
             let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
-            // Aggregate payments from all shards (issue #177).
-            let mut totals: Map<Address, i128> = Map::new(&env);
-            for shard_id in 0..SHARD_COUNT {
-                if let Some(shard_payments) = env
-                    .storage()
-                    .persistent()
-                    .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
-                {
-                    for payment in shard_payments.iter() {
-                        let prev = totals.get(payment.payer.clone()).unwrap_or(0);
-                        totals.set(payment.payer.clone(), prev + payment.amount);
-                    }
-                }
-            }
+            // Aggregate payments from all shards (issue #177, #945).
+            let totals = aggregate_shard_payments(&env, invoice_id);
 
             // Issue #89: Distribute stake equally among unique payers if stake exists.
             // (stake_amount field not yet on Invoice; skipped)
@@ -12043,18 +12019,8 @@ impl SplitContract {
             old_invoice.ratio_denominator,
         );
 
-        // Copy payments from shards to new invoice (issue #177).
-        for shard_id in 0..SHARD_COUNT {
-            if let Some(shard_payments) = env
-                .storage()
-                .persistent()
-                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
-            {
-                env.storage()
-                    .persistent()
-                    .set(&pay_shard_key(new_id, shard_id), &shard_payments);
-            }
-        }
+        // Copy payments from shards to new invoice (issue #177, #945).
+        copy_shard_payments(&env, invoice_id, new_id);
 
         // Load the newly created invoice and set funded amount.
         let mut new_invoice = load_invoice(&env, new_id);
@@ -15844,6 +15810,113 @@ impl SplitContract {
             0
         } else {
             ((invoice.funded * 10_000) / total) as u32
+        }
+    }
+
+    /// Issue #944: cursor-based pagination over invoices.
+    ///
+    /// Returns up to `limit` invoices with `invoice_id > cursor`, ordered by
+    /// ascending invoice ID (stable, deterministic). Pass `cursor = 0` to start
+    /// from the beginning. `limit` is clamped to `[1, MAX_PAGE_LIMIT]`.
+    ///
+    /// Limits: invoice IDs are dense and monotonically increasing, so the
+    /// returned page is always contiguous; a page shorter than `limit` means
+    /// the end of the list has been reached.
+    pub fn list_invoices(env: Env, cursor: u64, limit: u32) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new(&env);
+        if limit == 0 {
+            return out;
+        }
+        let page_limit = if limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            limit
+        };
+
+        let counter: u64 = env.storage().instance().get(&counter_key()).unwrap_or(0u64);
+        let mut next = cursor.saturating_add(1);
+        while next <= counter && out.len() < page_limit {
+            if env.storage().persistent().has(&invoice_key(next)) {
+                out.push_back(next);
+            }
+            next += 1;
+        }
+        out
+    }
+}
+
+/// Issue #944: maximum number of invoices returned by a single `list_invoices` page.
+const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Issue #936: validate a shard index against the configured shard count.
+///
+/// Shard indices are zero-based and must be strictly less than `SHARD_COUNT`.
+/// Panics with `ContractError::InvalidShardIndex` otherwise.
+fn validate_shard_index(env: &Env, shard_id: u64) {
+    if shard_id >= SHARD_COUNT {
+        panic_with_error!(env, ContractError::InvalidShardIndex);
+    }
+}
+
+/// Issue #936: validate a shard index together with the number of payments
+/// that will be written to it, ensuring the resulting shard stays within
+/// `MAX_PAYMENTS_PER_SHARD`.
+fn validate_shard_write(env: &Env, shard_id: u64, existing_len: u32, added: u32) {
+    validate_shard_index(env, shard_id);
+    let total = existing_len.saturating_add(added);
+    if total > MAX_PAYMENTS_PER_SHARD {
+        panic_with_error!(env, ContractError::ShardCapacityExceeded);
+    }
+}
+
+/// Issue #945: read a single payment shard, returning an empty vector when the
+/// shard has never been written.
+fn read_shard(env: &Env, invoice_id: u64, shard_id: u64) -> Vec<Payment> {
+    validate_shard_index(env, shard_id);
+    env.storage()
+        .persistent()
+        .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Issue #945: append payments to the shard for `invoice_id`, validating the
+/// shard index and capacity first. Returns the shard index that was written.
+fn append_shard_payments(env: &Env, invoice_id: u64, shard_id: u64, payments: &Vec<Payment>) -> u64 {
+    let existing = read_shard(env, invoice_id, shard_id);
+    validate_shard_write(env, shard_id, existing.len(), payments.len());
+    let mut merged = existing;
+    for p in payments.iter() {
+        merged.push_back(p);
+    }
+    env.storage()
+        .persistent()
+        .set(&pay_shard_key(invoice_id, shard_id), &merged);
+    shard_id
+}
+
+/// Issue #945: aggregate all shard payments for an invoice into a single
+/// per-payer total map, reading each shard exactly once.
+fn aggregate_shard_payments(env: &Env, invoice_id: u64) -> Map<Address, i128> {
+    let mut totals: Map<Address, i128> = Map::new(env);
+    for shard_id in 0..SHARD_COUNT {
+        let shard_payments = read_shard(env, invoice_id, shard_id);
+        for payment in shard_payments.iter() {
+            let prev = totals.get(payment.payer.clone()).unwrap_or(0);
+            totals.set(payment.payer.clone(), prev + payment.amount);
+        }
+    }
+    totals
+}
+
+/// Issue #945: copy every payment shard from one invoice to another.
+fn copy_shard_payments(env: &Env, from_id: u64, to_id: u64) {
+    for shard_id in 0..SHARD_COUNT {
+        let shard_payments = read_shard(env, from_id, shard_id);
+        if !shard_payments.is_empty() {
+            validate_shard_write(env, shard_id, 0, shard_payments.len());
+            env.storage()
+                .persistent()
+                .set(&pay_shard_key(to_id, shard_id), &shard_payments);
         }
     }
 }
