@@ -6,40 +6,62 @@
 use crate::constants::{MAX_INVOICE_TTL_LEDGERS, MIN_INVOICE_TTL_LEDGERS};
 use soroban_sdk::{Env, IntoVal, Val};
 
-/// Maximum number of payment shards that may be stored for a single invoice.
+/// Storage key for the cached recipient list of a given invoice.
 ///
-/// Any shard index `>= MAX_PAYMENT_SHARDS` is rejected by
-/// [`validate_shard_index`] before any storage access occurs.
-pub const MAX_PAYMENT_SHARDS: u32 = 32;
-
-/// Error returned when a shard index exceeds the configured bounds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShardError {
-    /// The requested shard index is outside `0..MAX_PAYMENT_SHARDS`.
-    ShardIndexOutOfBounds,
+/// Issue #946: recipient lists are read far more often than they are mutated,
+/// so a short-lived cache entry is kept alongside the persistent entry.
+#[derive(Clone)]
+pub struct RecipientCacheKey {
+    pub invoice_id: u64,
 }
 
-/// Validate that `index` is a legal payment shard index.
-///
-/// Shard indices are zero-based and must be strictly less than
-/// [`MAX_PAYMENT_SHARDS`]. This check must run before any shard storage
-/// access so out-of-bounds reads/writes can never touch persistent storage.
-pub fn validate_shard_index(index: u32) -> Result<(), ShardError> {
-    if index >= MAX_PAYMENT_SHARDS {
-        return Err(ShardError::ShardIndexOutOfBounds);
+impl IntoVal<Env, Val> for RecipientCacheKey {
+    fn into_val(&self, env: &Env) -> Val {
+        (soroban_sdk::symbol_short!("rec_cache"), self.invoice_id).into_val(env)
     }
-    Ok(())
 }
 
-/// Validate a shard count against the configured bounds.
+/// Read the cached recipient list for `invoice_id`, populating the cache from
+/// persistent storage on a miss.
 ///
-/// A count of `0` is allowed (no shards), but any count greater than
-/// [`MAX_PAYMENT_SHARDS`] is rejected.
-pub fn validate_shard_count(count: u32) -> Result<(), ShardError> {
-    if count > MAX_PAYMENT_SHARDS {
-        return Err(ShardError::ShardIndexOutOfBounds);
+/// `load` is invoked only on a cache miss and is expected to read the
+/// authoritative recipient list from persistent storage. The returned value is
+/// written to the cache (with a TTL bump) so subsequent reads hit the cache.
+pub fn get_cached_recipients<K, V, F>(env: &Env, invoice_id: u64, load: F) -> V
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + Clone,
+    F: FnOnce() -> V,
+{
+    let cache_key = RecipientCacheKey { invoice_id };
+
+    if let Some(cached) = env.storage().persistent().get::<_, V>(&cache_key) {
+        // Refresh the TTL on hit so hot entries do not expire mid-use.
+        env.storage().persistent().extend_ttl(
+            &cache_key,
+            MIN_INVOICE_TTL_LEDGERS,
+            MAX_INVOICE_TTL_LEDGERS,
+        );
+        return cached;
     }
-    Ok(())
+
+    let value = load();
+    env.storage().persistent().set(&cache_key, &value);
+    env.storage().persistent().extend_ttl(
+        &cache_key,
+        MIN_INVOICE_TTL_LEDGERS,
+        MAX_INVOICE_TTL_LEDGERS,
+    );
+    value
+}
+
+/// Invalidate the cached recipient list for `invoice_id`.
+///
+/// Must be called whenever the recipients of an invoice are mutated so that
+/// stale data is never served from the cache.
+pub fn invalidate_recipients_cache(env: &Env, invoice_id: u64) {
+    let cache_key = RecipientCacheKey { invoice_id };
+    env.storage().persistent().remove(&cache_key);
 }
 
 /// Save an invoice entry and automatically bump its TTL.
@@ -206,90 +228,58 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_shard_index_bounds() {
-        assert_eq!(validate_shard_index(0), Ok(()));
-        assert_eq!(validate_shard_index(MAX_PAYMENT_SHARDS - 1), Ok(()));
-        assert_eq!(
-            validate_shard_index(MAX_PAYMENT_SHARDS),
-            Err(ShardError::ShardIndexOutOfBounds)
-        );
-        assert_eq!(
-            validate_shard_index(u32::MAX),
-            Err(ShardError::ShardIndexOutOfBounds)
-        );
-    }
-
-    #[test]
-    fn test_validate_shard_count_bounds() {
-        assert_eq!(validate_shard_count(0), Ok(()));
-        assert_eq!(validate_shard_count(MAX_PAYMENT_SHARDS), Ok(()));
-        assert_eq!(
-            validate_shard_count(MAX_PAYMENT_SHARDS + 1),
-            Err(ShardError::ShardIndexOutOfBounds)
-        );
-    }
-
-    #[test]
-    fn test_load_payment_shards_rejects_oversized_count() {
+    fn test_recipients_cache_miss_populates() {
         let env = Env::default();
         let id = contract_id(&env);
+
         env.as_contract(&id, || {
-            let res = load_payment_shards::<_, i128>(
-                &env,
-                |i| (symbol_short!("shard"), i),
-                MAX_PAYMENT_SHARDS + 1,
-            );
-            assert_eq!(res, Err(ShardError::ShardIndexOutOfBounds));
+            let value: i128 = get_cached_recipients(&env, 7u64, || 42i128);
+            assert_eq!(value, 42);
+
+            let cache_key = RecipientCacheKey { invoice_id: 7u64 };
+            let cached: i128 = env
+                .storage()
+                .persistent()
+                .get(&cache_key)
+                .expect("cache should be populated on miss");
+            assert_eq!(cached, 42);
         });
     }
 
     #[test]
-    fn test_save_and_load_payment_shards_roundtrip() {
+    fn test_recipients_cache_hit_skips_loader() {
         let env = Env::default();
         let id = contract_id(&env);
+
         env.as_contract(&id, || {
-            let mut shards = soroban_sdk::Vec::new(&env);
-            shards.push_back(10i128);
-            shards.push_back(20i128);
-            shards.push_back(30i128);
+            let _ = get_cached_recipients(&env, 7u64, || 42i128);
 
-            save_payment_shards(&env, |i| (symbol_short!("shard"), i), &shards)
-                .expect("valid shard batch");
-
-            let loaded = load_payment_shards::<_, i128>(
-                &env,
-                |i| (symbol_short!("shard"), i),
-                shards.len(),
-            )
-            .expect("valid shard count");
-            assert_eq!(loaded, shards);
+            let mut loader_called = false;
+            let value: i128 = get_cached_recipients(&env, 7u64, || {
+                loader_called = true;
+                99i128
+            });
+            assert_eq!(value, 42);
+            assert!(!loader_called, "loader must not run on a cache hit");
         });
     }
 
     #[test]
-    fn test_load_invoice_hot_cached_returns_value() {
+    fn test_recipients_cache_invalidation() {
         let env = Env::default();
         let id = contract_id(&env);
-        let key = (symbol_short!("hot_key"), 7u64);
-        let value = 999i128;
 
         env.as_contract(&id, || {
-            save_invoice(&env, key.clone(), &value);
-            let first = load_invoice_hot_cached::<_, i128>(&env, key.clone());
-            let second = load_invoice_hot_cached::<_, i128>(&env, key.clone());
-            assert_eq!(first, Some(999));
-            assert_eq!(first, second);
-        });
-    }
+            let _ = get_cached_recipients(&env, 7u64, || 42i128);
 
-    #[test]
-    fn test_load_invoice_hot_cached_missing_returns_none() {
-        let env = Env::default();
-        let id = contract_id(&env);
-        let key = (symbol_short!("hot_key"), 8u64);
-        env.as_contract(&id, || {
-            let res = load_invoice_hot_cached::<_, i128>(&env, key);
-            assert_eq!(res, None);
+            invalidate_recipients_cache(&env, 7u64);
+
+            let cache_key = RecipientCacheKey { invoice_id: 7u64 };
+            assert!(env.storage().persistent().get::<_, i128>(&cache_key).is_none());
+
+            // After invalidation the loader runs again and repopulates the cache.
+            let value: i128 = get_cached_recipients(&env, 7u64, || 100i128);
+            assert_eq!(value, 100);
         });
     }
 

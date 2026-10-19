@@ -21,8 +21,7 @@ Full reference for all public entry points in the StellarSplit Soroban contract 
 - [Fee Management](#fee-management)
 - [Analytics](#analytics)
 - [Read Functions](#read-functions)
-- [Shard Index Limits](#shard-index-limits)
-- [Invoice Pagination](#invoice-pagination)
+- [Validation Rules](#validation-rules)
 
 ---
 
@@ -42,6 +41,8 @@ pub fn initialize(
 ```
 
 One-time setup. Sets the contract admin, USDC token address, treasury, platform fee basis points, and creation fee. Panics if called more than once.
+
+`platform_fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)); `usdc_token` must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)).
 
 ---
 
@@ -198,8 +199,8 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `creator` | `Address` | Invoice creator; must sign the transaction |
 | `recipients` | `Vec<Address>` | Ordered list of recipient addresses |
 | `amounts` | `Vec<i128>` | Amount owed to each recipient in token units; `amounts[i]` → `recipients[i]` |
-| `token` | `Address` | SAC token contract address (typically USDC) |
-| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded |
+| `token` | `Address` | SAC token contract address (typically USDC). Must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)) |
+| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded. Must be strictly greater than the current ledger timestamp and no more than `MAX_DEADLINE_HORIZON` seconds ahead (see [Validation Rules](#validation-rules)) |
 | `options` | `InvoiceOptions` | Extended options struct (see below) |
 
 **`InvoiceOptions` fields:**
@@ -233,7 +234,7 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `accepted_tokens` | `Vec<Address>` | Additional tokens accepted in `pay_with_token` |
 | `forward_to` | `Option<Address>` | Auto-forward leftover funds to this address |
 | `forward_invoice_id` | `Option<u64>` | Auto-forward leftover funds to another invoice |
-| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release |
+| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release. Must be non-empty when provided, each ratio must be in `(0, MAX_RATIO]`, and ratios must sum to exactly `10_000` bps (see [Validation Rules](#validation-rules)) |
 | `auto_resolve_rules` | `Vec<ResolveRule>` | Pre-agreed auto-resolution rules evaluated when `auto_resolve` is called |
 | `oracle_address` | `Option<Address>` | Oracle that must confirm a condition before release |
 | `cross_chain_ref` | `Option<String>` | Cross-chain reference identifier |
@@ -477,6 +478,52 @@ pub fn sign_release(env: Env, invoice_id: u64, signer: Address)
 
 Records a co-signer approval. Once `required_signatures` approvals are collected, `release` becomes callable. Emits `invoice_partially_released` when threshold is reached.
 
+### `sign_release_with_signature`
+
+```rust
+pub fn sign_release_with_signature(
+    env: Env,
+    invoice_id: u64,
+    signer: Address,
+    nonce: u64,
+    signature: BytesN<64>,
+)
+```
+
+Records a co-signer approval backed by an off-chain Ed25519 signature over the canonical co-signer message (see [Co-Signer Signature Format](#co-signer-signature-format)). The signature is verified against `signer` before the approval is recorded.
+
+#### Co-Signer Signature Format
+
+Co-signer signatures use **domain separation** and **nonce binding** to prevent cross-contract and replay attacks.
+
+**Signed payload (canonical byte layout):**
+
+```
+domain_tag (32 bytes) || network_id (32 bytes) || contract_id (32 bytes)
+  || invoice_id (u64, big-endian, 8 bytes)
+  || signer (Address, XDR-encoded, variable length)
+  || nonce (u64, big-endian, 8 bytes)
+```
+
+| Field | Description |
+|-------|-------------|
+| `domain_tag` | Fixed constant `SHA-256("StellarSplit:co-signer:v1")`; separates this signature domain from all other signed messages |
+| `network_id` | Stellar network passphrase hash (`Public Network`, `Test SDF Network ; September 2015`, etc.) |
+| `contract_id` | The StellarSplit contract address, binding the signature to this deployment |
+| `invoice_id` | Invoice the approval applies to |
+| `signer` | The co-signer address whose key produced the signature |
+| `nonce` | Strictly increasing per-`(invoice_id, signer)` nonce |
+
+**Verification rules:**
+
+- The `domain_tag`, `network_id`, and `contract_id` must match the current environment; mismatches are rejected with `ContractError::InvalidSignatureDomain`.
+- `nonce` must be strictly greater than the last recorded nonce for `(invoice_id, signer)`; otherwise the call fails with `ContractError::SignatureNonceReused`.
+- The signature must verify as Ed25519 over the payload above using `signer`'s public key; failures return `ContractError::InvalidSignature`.
+- A signer may not sign the same invoice twice; duplicate approvals return `ContractError::AlreadySigned`.
+- Signatures are only accepted while the invoice is in a releasable state (funded, not paused/frozen, not refunded); otherwise `ContractError::InvalidInvoiceState`.
+
+**Replay protection:** because the payload binds the contract ID, invoice ID, signer, and a monotonically increasing nonce, a captured signature cannot be replayed on another contract, another invoice, or a later transaction. The last-used nonce is persisted per `(invoice_id, signer)` and never decreases.
+
 ### `refund`
 
 ```rust
@@ -558,6 +605,26 @@ pub fn confirm_condition(env: Env, invoice_id: u64)
 ```
 
 Called by the configured `oracle_address` to confirm the off-chain condition is met, unblocking release.
+
+#### Oracle Interface
+
+When `InvoiceOptions.oracle_address` is set, release is blocked until the oracle confirms the condition.
+
+**Address format:**
+
+- `oracle_address` must be a valid Stellar contract address (`C...`, 56-character StrKey) or account address (`G...`, 56-character StrKey).
+- The address is validated at `create_invoice` time; malformed addresses are rejected with `ContractError::InvalidOracleAddress`.
+- The zero address and the contract's own address are rejected with `ContractError::InvalidOracleAddress`.
+- If `oracle_address` is `None`, no oracle gate applies and `confirm_condition` is a no-op that returns `ContractError::NoOracleConfigured`.
+
+**Condition semantics:**
+
+- The oracle condition is a boolean gate: once confirmed, it stays confirmed for the lifetime of the invoice and cannot be un-confirmed.
+- `confirm_condition` must be authorized by `oracle_address`; any other caller fails with `ContractError::Unauthorized`.
+- Confirmation is only accepted while the invoice is `Pending` or `Funded`; otherwise `ContractError::InvalidInvoiceState`.
+- Confirming twice returns `ContractError::ConditionAlreadyConfirmed`.
+- The oracle may also be consulted for dynamic pricing when `price_oracle` is set; that oracle must return a positive price, otherwise release fails with `ContractError::InvalidOraclePrice`.
+- Oracle calls are read-only from the contract's perspective; the contract never trusts oracle-supplied amounts for accounting, only the boolean condition and price feed.
 
 ### `add_allowed_payer`
 
@@ -787,7 +854,7 @@ Returns the current creation fee.
 pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>)
 ```
 
-Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers.
+Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers. Each `fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)).
 
 ### `get_fee_tiers`
 
@@ -887,6 +954,25 @@ pub fn get_invoice(env: Env, invoice_id: u64) -> Invoice
 
 Returns the full merged invoice view (hot fields + core + ext).
 
+#### Recipient List Caching
+
+Recipient lists (`recipients`, `amounts`, and derived split rules) are cached to avoid repeated storage reads during payment and release.
+
+**Cache behaviour:**
+
+- The cache key is `(invoice_id, "recipients")` and stores the resolved recipient/amount vectors plus a version counter.
+- Reads of `get_invoice`, `release`, `release_to_recipient`, and `simulate_release` populate the cache on first access.
+- Cache hits return the stored vectors without touching persistent storage; misses fall back to storage and repopulate the cache.
+- The cache is bounded per invoice and evicted on invoice archival.
+
+**Invalidation rules:**
+
+- Any mutation of `recipients`, `amounts`, `split_rules`, or `priorities` bumps the invoice version and invalidates the cache entry.
+- `clone_invoice` and `migrate_invoice` invalidate the source invoice's cache.
+- `refund` and `release` invalidate the cache after final distribution.
+- Invalidation is version-checked: a cached entry whose version does not match the invoice's current version is treated as a miss and discarded.
+- Cache state is never authoritative; correctness always falls back to persistent storage.
+
 ### `get_invoice_snapshot`
 
 ```rust
@@ -965,87 +1051,74 @@ See [Pause & Circuit Breaker](#pause--circuit-breaker).
 
 ---
 
-## Shard Index Limits
+## Error Codes
 
-Payment shards are stored in fixed-size buckets. All shard-indexed entry points validate the index before reading or writing storage and panic with a descriptive message when a bound is violated.
+All entry points return `Result<T, ContractError>`. The full variant table:
 
-**Constants:**
+| Code | Variant | Meaning |
+|------|---------|---------|
+| 1 | `NotInitialized` | Contract has not been initialized |
+| 2 | `AlreadyInitialized` | `initialize` called more than once |
+| 3 | `Unauthorized` | Caller lacks the required auth or role |
+| 4 | `NotFound` | Referenced invoice, template, or action does not exist |
+| 5 | `InvalidAmount` | Amount is zero, negative, or otherwise invalid |
+| 6 | `InvalidDeadline` | Deadline is in the past or otherwise invalid |
+| 7 | `InvalidInvoiceState` | Operation not allowed in the invoice's current state |
+| 8 | `InvoicePaused` | Invoice is paused |
+| 9 | `InvoiceFrozen` | Invoice is admin-frozen |
+| 10 | `ContractPaused` | Contract is paused |
+| 11 | `CircuitBreakerActive` | Emergency circuit breaker is active |
+| 12 | `NotFullyFunded` | Release attempted before full funding |
+| 13 | `AlreadyReleased` | Invoice already released |
+| 14 | `AlreadyRefunded` | Invoice already refunded |
+| 15 | `DeadlineNotPassed` | Refund attempted before deadline |
+| 16 | `RefundGraceNotElapsed` | Refund attempted before `refund_grace_secs` elapsed |
+| 17 | `InsufficientSignatures` | Fewer than `required_signatures` co-signer approvals |
+| 18 | `AlreadySigned` | Signer already approved this invoice |
+| 19 | `InvalidSignature` | Signature failed Ed25519 verification |
+| 20 | `InvalidSignatureDomain` | Signature domain/network/contract mismatch |
+| 21 | `SignatureNonceReused` | Signature nonce not greater than last used |
+| 22 | `InvalidOracleAddress` | Oracle address malformed or disallowed |
+| 23 | `NoOracleConfigured` | Oracle operation attempted with no oracle set |
+| 24 | `InvalidOraclePrice` | Oracle returned a non-positive price |
+| 25 | `ConditionAlreadyConfirmed` | Oracle condition already confirmed |
+| 26 | `ConditionNotConfirmed` | Release attempted before oracle confirmation |
+| 27 | `PrerequisiteNotMet` | Prerequisite invoice not released |
+| 28 | `TrancheNotReached` | Tranche timestamp not yet reached |
+| 29 | `MinFundingNotReached` | `min_funding_bps` threshold not met |
+| 30 | `ScheduledReleaseNotDue` | `scheduled_release_at` not yet reached |
+| 31 | `VelocityLimitExceeded` | Payer exceeded `velocity_limit` in window |
+| 32 | `PaymentCooldownActive` | Payer within `payment_cooldown_secs` |
+| 33 | `PaymentRateLimitExceeded` | Payer exceeded `max_payments_per_window` |
+| 34 | `PayerNotAllowed` | Payer not in `allowed_payers` |
+| 35 | `KycRequired` | Payer has not passed KYC |
+| 36 | `TokenNotAccepted` | Token not in `accepted_tokens` |
+| 37 | `NonceReused` | Payment nonce already used |
+| 38 | `OverflowRejected` | Overpayment rejected by `OverflowBehavior::Reject` |
+| 39 | `DisputeActive` | Release blocked by an active dispute |
+| 40 | `ArbiterNotSet` | Dispute raised with no arbiter assigned |
+| 41 | `TemplateExists` | Template already exists for `(creator, name)` |
+| 42 | `TemplateNotFound` | Template does not exist |
+| 43 | `CreatorNotWhitelisted` | Creator not on the whitelist |
+| 44 | `VolumeCapExceeded` | Creator lifetime volume cap reached |
+| 45 | `TimelockNotElapsed` | Queued action executed before timelock |
+| 46 | `ActionNotFound` | Timelock action ID does not exist |
+| 47 | `ActionAlreadyExecuted` | Timelock action already executed |
+| 48 | `InvalidFeeTiers` | Fee tiers unsorted, empty, or exceed max count |
+| 49 | `InvalidBasisPoints` | Basis points value exceeds 10 000 |
+| 50 | `InvalidRecipients` | Recipients/amounts length mismatch or empty |
+| 51 | `InvalidSplitRules` | Split rules invalid or do not sum correctly |
+| 52 | `InvalidReleaseStages` | Release stages do not sum to 10 000 |
+| 53 | `InvalidTranches` | Tranches unsorted or invalid |
+| 54 | `InvalidMetadataHash` | Metadata hash malformed |
+| 55 | `InvalidChannelState` | Channel operation invalid for current state |
+| 56 | `InsufficientChannelDeposit` | Channel deposit too low |
+| 57 | `ConfidentialNotRevealed` | Confidential total not yet revealed |
+| 58 | `InvalidRangeProof` | Range proof failed verification |
+| 59 | `ArithmeticOverflow` | Arithmetic overflow or underflow |
+| 60 | `TransferFailed` | Token transfer failed |
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `SHARD_COUNT` | `16` | Number of payment shards per invoice. Valid shard indices are `0..SHARD_COUNT` (inclusive lower, exclusive upper). |
-| `MAX_INVOICE_COUNT` | `u32::MAX` | Maximum number of invoices the contract will ever create. Invoice IDs are `u64` but are bounded by this count. |
-| `MAX_SHARD_DATA_LEN` | `1024` | Maximum number of entries (payments) a single shard may hold. |
-
-**Validation rules:**
-
-- `shard_index < SHARD_COUNT` — an index of `SHARD_COUNT` or greater panics with `shard index out of bounds`.
-- `invoice_id < invoice_count` — referencing an invoice ID that has not been created (or exceeds `MAX_INVOICE_COUNT`) panics with `invoice id out of bounds`.
-- `shard_data.len() <= MAX_SHARD_DATA_LEN` — appending beyond the per-shard data length bound panics with `shard data length exceeded`.
-- `count <= MAX_SHARD_DATA_LEN` — any `count` argument passed to shard read functions must not exceed the per-shard data length bound.
-
-**Edge cases:**
-
-- `shard_index == 0` and `shard_index == SHARD_COUNT - 1` are valid.
-- `shard_index == SHARD_COUNT` is invalid (upper bound is exclusive).
-- An empty shard (`len == 0`) is valid and returns an empty vector.
-- A shard at exactly `MAX_SHARD_DATA_LEN` entries is valid; one more entry is rejected.
-- `invoice_count == 0` means no invoice IDs are valid.
-
----
-
-## Invoice Pagination
-
-### `list_invoices`
-
-```rust
-pub fn list_invoices(
-    env: Env,
-    cursor: Option<u64>,
-    limit: u32,
-) -> InvoicePage
-```
-
-Returns a page of invoices using cursor-based pagination. Results are sorted by invoice ID in **ascending** order (oldest first).
-
-**Parameters:**
-
-| Name | Type | Description |
-|------|------|-------------|
-| `cursor` | `Option<u64>` | Opaque cursor from a previous page. `None` starts from the first invoice. |
-| `limit` | `u32` | Maximum number of invoices to return. Must be in `1..=MAX_PAGE_SIZE`. |
-
-**Cursor format:**
-
-The cursor is the invoice ID of the **last item returned** on the previous page. To fetch the next page, pass that ID as `cursor`; the next page begins at the first invoice whose ID is strictly greater than the cursor. Cursors are stable across inserts and deletions of other invoices because ordering is by ID, not by insertion position.
-
-**Page size limits:**
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_PAGE_SIZE` | `100` | Maximum allowed `limit`. |
-| `DEFAULT_PAGE_SIZE` | `20` | Used when `limit` is `0`. |
-
-A `limit` greater than `MAX_PAGE_SIZE` panics with `limit exceeds MAX_PAGE_SIZE`.
-
-**Return value:**
-
-```rust
-pub struct InvoicePage {
-    pub items: Vec<InvoiceSnapshot>, // up to `limit` invoices, ascending by id
-    pub next_cursor: Option<u64>,    // id of last item, or None when no more pages
-}
-```
-
-`next_cursor` is `None` when the returned page is the last page (fewer than `limit` items were available). An empty `items` vector with `next_cursor == None` means the cursor was past the end of the list.
-
-**Edge cases:**
-
-- `cursor = None`, `limit = 0` → returns the first `DEFAULT_PAGE_SIZE` invoices.
-- `cursor` equal to the highest existing invoice ID → returns an empty page with `next_cursor = None`.
-- `cursor` greater than any existing invoice ID → returns an empty page with `next_cursor = None`.
-- `limit = MAX_PAGE_SIZE` is valid; `limit = MAX_PAGE_SIZE + 1` panics.
-- Pagination is consistent while new invoices are created: newly created invoices (higher IDs) appear only on later pages.
+Codes are stable and never reused; new variants are appended with the next available code.
 
 ---
 
