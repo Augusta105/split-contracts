@@ -256,8 +256,9 @@ Core inputs are validated before any storage is written. Each failure aborts wit
 | any amount ≤ 0 | `ZeroAmountNotAllowed` (41) |
 | `deadline` ≤ current ledger timestamp | `DeadlinePassed` (3) |
 | `deadline` more than `MAX_DEADLINE_HORIZON_SECS` (~10 years) ahead | `InvalidDeadline` (67) |
+| a recipient has a malformed strkey or bad checksum, is an all-zero key, or is the contract itself (issue #932) | `InvalidRecipientAddress` (68) |
 
-The same checks apply to `create_invoices_batch`. The recipients/amounts checks also apply to `create_subscription` and `save_template`.
+The same checks apply to `create_invoices_batch`. Recipient address validation also applies to `add_recipient`. The recipients/amounts checks also apply to `create_subscription` and `save_template`.
 
 ### `create_batch`
 

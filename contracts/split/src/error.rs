@@ -148,4 +148,7 @@ pub enum ContractError {
     /// Issue #931: Invoice deadline is beyond the maximum allowed horizon
     /// (`validation::MAX_DEADLINE_HORIZON_SECS` from the current ledger time).
     InvalidDeadline = 67,
+    /// Issue #932: A recipient is not a well-formed Stellar address — bad
+    /// strkey format or checksum, an all-zero key, or the contract itself.
+    InvalidRecipientAddress = 68,
 }

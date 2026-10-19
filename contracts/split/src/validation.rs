@@ -65,6 +65,135 @@ pub fn validate_deadline(env: &Env, deadline: u64) -> Result<(), ContractError> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Issue #932: Recipient address validation
+// ---------------------------------------------------------------------------
+
+/// Length of an account (`G…`) or contract (`C…`) strkey.
+pub const STRKEY_LEN: usize = 56;
+/// Decoded strkey length: 1 version byte + 32-byte payload + 2-byte checksum.
+const STRKEY_RAW_LEN: usize = 35;
+/// Strkey version byte for an ed25519 account public key (`G…`).
+const VERSION_ACCOUNT: u8 = 6 << 3;
+/// Strkey version byte for a contract id (`C…`).
+const VERSION_CONTRACT: u8 = 2 << 3;
+
+/// Map an RFC 4648 base32 character to its 5-bit value.
+fn base32_value(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
+    }
+}
+
+/// CRC16-XModem (poly 0x1021, init 0) — the checksum used by Stellar strkeys.
+fn crc16_xmodem(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Validate a raw strkey for a recipient address.
+///
+/// Checks:
+/// - **format** — exactly [`STRKEY_LEN`] uppercase base32 characters, starting
+///   with `G` (account) or `C` (contract); muxed (`M…`), secret (`S…`) and other
+///   key types are rejected
+/// - **checksum** — the trailing CRC16-XModem (little-endian) matches the
+///   version byte and payload
+/// - **non-zero** — the 32-byte payload is not all zeros (e.g. the
+///   `GAAAA…WHF` zero account, which nobody controls)
+///
+/// Fixed-size buffers only; no allocation.
+///
+/// # Errors
+/// Returns [ContractError::InvalidRecipientAddress] on any failure.
+pub fn validate_strkey(strkey: &[u8]) -> Result<(), ContractError> {
+    if strkey.len() != STRKEY_LEN {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+
+    // Base32-decode 56 chars (280 bits) into exactly 35 bytes.
+    let mut raw = [0u8; STRKEY_RAW_LEN];
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = 0usize;
+    for &c in strkey {
+        let v = base32_value(c).ok_or(ContractError::InvalidRecipientAddress)?;
+        acc = (acc << 5) | v as u32;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            raw[out] = (acc >> bits) as u8;
+            out += 1;
+            acc &= (1 << bits) - 1;
+        }
+    }
+    if out != STRKEY_RAW_LEN {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+
+    let version = raw[0];
+    if version != VERSION_ACCOUNT && version != VERSION_CONTRACT {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+
+    let expected = crc16_xmodem(&raw[..33]);
+    let actual = u16::from_le_bytes([raw[33], raw[34]]);
+    if expected != actual {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+
+    if raw[1..33].iter().all(|b| *b == 0) {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+    Ok(())
+}
+
+/// Issue #932: Validate a single recipient address.
+///
+/// Runs [`validate_strkey`] on the address's strkey and additionally rejects
+/// the current contract's own address, which would strand funds in escrow.
+///
+/// # Errors
+/// Returns [ContractError::InvalidRecipientAddress] on any failure.
+pub fn validate_recipient_address(env: &Env, recipient: &Address) -> Result<(), ContractError> {
+    if *recipient == env.current_contract_address() {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+    let strkey = recipient.to_string();
+    if strkey.len() as usize != STRKEY_LEN {
+        return Err(ContractError::InvalidRecipientAddress);
+    }
+    let mut buf = [0u8; STRKEY_LEN];
+    strkey.copy_into_slice(&mut buf);
+    validate_strkey(&buf)
+}
+
+/// Issue #932: Validate every address in a recipient list.
+///
+/// # Errors
+/// Returns [ContractError::InvalidRecipientAddress] for the first invalid address.
+pub fn validate_recipient_addresses(
+    env: &Env,
+    recipients: &Vec<Address>,
+) -> Result<(), ContractError> {
+    for r in recipients.iter() {
+        validate_recipient_address(env, &r)?;
+    }
+    Ok(())
+}
+
 /// Issue #931: Validate every core input to invoice creation before any
 /// storage is written: recipients/amounts arrays and the deadline.
 ///
@@ -379,6 +508,154 @@ mod tests {
             Err(ContractError::InvalidDeadline)
         );
         assert_eq!(validate_deadline(&env, u64::MAX), Err(ContractError::InvalidDeadline));
+    }
+
+    // --- recipient address validation (issue #932) ---
+
+    /// The all-zero ed25519 account: valid format and checksum, zero payload.
+    const ZERO_ACCOUNT: &[u8] = b"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    fn strkey_of(addr: &Address) -> [u8; STRKEY_LEN] {
+        let s = addr.to_string();
+        let mut buf = [0u8; STRKEY_LEN];
+        s.copy_into_slice(&mut buf);
+        buf
+    }
+
+    /// Re-encode `raw` (version + payload) as a strkey with a correct checksum.
+    fn encode_strkey(version: u8, payload: &[u8; 32]) -> [u8; STRKEY_LEN] {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut raw = [0u8; STRKEY_RAW_LEN];
+        raw[0] = version;
+        raw[1..33].copy_from_slice(payload);
+        let crc = crc16_xmodem(&raw[..33]).to_le_bytes();
+        raw[33] = crc[0];
+        raw[34] = crc[1];
+        let mut out = [0u8; STRKEY_LEN];
+        let (mut acc, mut bits, mut i) = (0u32, 0u32, 0usize);
+        for b in raw {
+            acc = (acc << 8) | b as u32;
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out[i] = ALPHABET[((acc >> bits) & 31) as usize];
+                i += 1;
+            }
+            acc &= (1 << bits) - 1;
+        }
+        out
+    }
+
+    #[test]
+    fn crc16_xmodem_known_vector() {
+        // Standard CRC-16/XMODEM check value for "123456789".
+        assert_eq!(crc16_xmodem(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn generated_addresses_are_valid() {
+        let env = Env::default();
+        for _ in 0..10 {
+            let a = Address::generate(&env);
+            assert_eq!(validate_strkey(&strkey_of(&a)), Ok(()));
+            assert_eq!(validate_recipient_address(&env, &a), Ok(()));
+        }
+    }
+
+    #[test]
+    fn nonzero_account_and_contract_strkeys_valid() {
+        let mut payload = [0u8; 32];
+        payload[31] = 1;
+        assert_eq!(validate_strkey(&encode_strkey(VERSION_ACCOUNT, &payload)), Ok(()));
+        assert_eq!(validate_strkey(&encode_strkey(VERSION_CONTRACT, &payload)), Ok(()));
+        let all_ff = [0xFFu8; 32];
+        assert_eq!(validate_strkey(&encode_strkey(VERSION_ACCOUNT, &all_ff)), Ok(()));
+    }
+
+    #[test]
+    fn zero_account_rejected() {
+        assert_eq!(validate_strkey(ZERO_ACCOUNT), Err(ContractError::InvalidRecipientAddress));
+        let zero = [0u8; 32];
+        assert_eq!(
+            validate_strkey(&encode_strkey(VERSION_CONTRACT, &zero)),
+            Err(ContractError::InvalidRecipientAddress)
+        );
+    }
+
+    #[test]
+    fn bad_checksum_rejected() {
+        let env = Env::default();
+        let mut key = strkey_of(&Address::generate(&env));
+        // Flip one character in the payload; CRC16 detects every single-symbol error.
+        key[20] = if key[20] == b'A' { b'B' } else { b'A' };
+        assert_eq!(validate_strkey(&key), Err(ContractError::InvalidRecipientAddress));
+    }
+
+    #[test]
+    fn wrong_length_rejected() {
+        let env = Env::default();
+        let key = strkey_of(&Address::generate(&env));
+        assert_eq!(validate_strkey(&key[..55]), Err(ContractError::InvalidRecipientAddress));
+        assert_eq!(validate_strkey(&[]), Err(ContractError::InvalidRecipientAddress));
+        let mut long = [b'A'; 57];
+        long[..56].copy_from_slice(&key);
+        assert_eq!(validate_strkey(&long), Err(ContractError::InvalidRecipientAddress));
+    }
+
+    #[test]
+    fn invalid_characters_rejected() {
+        let env = Env::default();
+        let mut key = strkey_of(&Address::generate(&env));
+        key[10] = b'a'; // lowercase
+        assert_eq!(validate_strkey(&key), Err(ContractError::InvalidRecipientAddress));
+        key[10] = b'1'; // not in base32 alphabet
+        assert_eq!(validate_strkey(&key), Err(ContractError::InvalidRecipientAddress));
+        key[10] = b'=';
+        assert_eq!(validate_strkey(&key), Err(ContractError::InvalidRecipientAddress));
+    }
+
+    #[test]
+    fn unsupported_key_types_rejected() {
+        let mut payload = [0u8; 32];
+        payload[0] = 7;
+        // Secret seed (S…, version 18 << 3) and pre-auth tx (T…, version 19 << 3).
+        assert_eq!(
+            validate_strkey(&encode_strkey(18 << 3, &payload)),
+            Err(ContractError::InvalidRecipientAddress)
+        );
+        assert_eq!(
+            validate_strkey(&encode_strkey(19 << 3, &payload)),
+            Err(ContractError::InvalidRecipientAddress)
+        );
+    }
+
+    #[test]
+    fn contract_self_address_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(crate::SplitContract, ());
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                validate_recipient_address(&env, &contract_id),
+                Err(ContractError::InvalidRecipientAddress)
+            );
+            let other = Address::generate(&env);
+            assert_eq!(validate_recipient_address(&env, &other), Ok(()));
+        });
+    }
+
+    #[test]
+    fn recipient_list_reports_first_invalid() {
+        let env = Env::default();
+        let contract_id = env.register(crate::SplitContract, ());
+        env.as_contract(&contract_id, || {
+            let mut list = addrs(&env, 3);
+            assert_eq!(validate_recipient_addresses(&env, &list), Ok(()));
+            list.push_back(contract_id.clone());
+            assert_eq!(
+                validate_recipient_addresses(&env, &list),
+                Err(ContractError::InvalidRecipientAddress)
+            );
+        });
     }
 
     // --- assert_bps_sum (issue #623) ---

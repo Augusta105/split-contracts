@@ -5408,6 +5408,10 @@ impl SplitContract {
         if let Err(e) = validation::validate_invoice_inputs(env, &recipients, &amounts, deadline) {
             env.panic_with_error(e);
         }
+        // Issue #932: every recipient must be a well-formed, non-zero Stellar address.
+        if let Err(e) = validation::validate_recipient_addresses(env, &recipients) {
+            env.panic_with_error(e);
+        }
         // Issue #526: enforce minimum recipient count.
         {
             let min_recipients: u32 = env
@@ -12097,6 +12101,10 @@ impl SplitContract {
         );
         assert!(!invoice.disputed, "invoice is disputed");
         assert!(invoice.creator == caller, "only creator can add recipients");
+        // Issue #932: reject malformed or zero recipient addresses.
+        if let Err(e) = validation::validate_recipient_address(&env, &recipient) {
+            env.panic_with_error(e);
+        }
         assert!(
             invoice.funded == 0,
             "cannot add recipient after payment received"
