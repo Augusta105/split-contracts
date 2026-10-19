@@ -4,7 +4,59 @@
 //! that TTL bump calls are consistent and cannot be accidentally forgotten.
 
 use crate::constants::{MAX_INVOICE_TTL_LEDGERS, MIN_INVOICE_TTL_LEDGERS};
-use soroban_sdk::{Env, IntoVal, Val};
+use soroban_sdk::{Env, IntoVal, TryFromVal, Val};
+
+/// TTL (in ledgers) applied to cached invoice extension entries.
+///
+/// Issue #942: extension data is loaded lazily and cached in temporary
+/// storage so repeated reads within the same ledger window avoid the
+/// persistent-storage round trip.
+pub const INVOICE_EXT_CACHE_TTL_LEDGERS: u32 = 100;
+
+/// Storage key used to cache the invoice extension payload for an invoice id.
+fn invoice_ext_cache_key(env: &Env, invoice_id: u64) -> Val {
+    (soroban_sdk::symbol_short!("inv_ext"), invoice_id).into_val(env)
+}
+
+/// Lazily load the invoice extension payload, caching the result in
+/// temporary storage.
+///
+/// Returns `None` when no extension data is stored for `invoice_id`.
+/// The first call reads persistent storage and populates the cache; later
+/// calls within the cache TTL are served from temporary storage.
+pub fn load_invoice_ext_cached<V>(env: &Env, invoice_id: u64) -> Option<V>
+where
+    V: IntoVal<Env, Val> + TryFromVal<Env, Val>,
+{
+    let cache_key = invoice_ext_cache_key(env, invoice_id);
+
+    if let Some(cached) = env.storage().temporary().get::<Val, V>(&cache_key) {
+        return Some(cached);
+    }
+
+    let ext_key = (soroban_sdk::symbol_short!("inv_ext"), invoice_id);
+    let value: Option<V> = env.storage().persistent().get(&ext_key);
+
+    if value.is_some() {
+        env.storage().temporary().set(&cache_key, &value);
+        env.storage().temporary().extend_ttl(
+            &cache_key,
+            INVOICE_EXT_CACHE_TTL_LEDGERS,
+            INVOICE_EXT_CACHE_TTL_LEDGERS,
+        );
+    }
+
+    value
+}
+
+/// Invalidate the cached invoice extension payload for `invoice_id`.
+///
+/// Must be called whenever the underlying extension data changes so that
+/// stale extension data is never served from the cache.
+pub fn invalidate_invoice_ext_cache(env: &Env, invoice_id: u64) {
+    let cache_key = invoice_ext_cache_key(env, invoice_id);
+    env.storage().temporary().remove(&cache_key);
+}
 
 /// Storage key for the cached recipient list of a given invoice.
 ///

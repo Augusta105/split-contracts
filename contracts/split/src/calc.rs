@@ -34,10 +34,58 @@
 
 #[allow(unused_imports)]
 use crate::types::BASIS_POINTS_TOTAL;
-use soroban_sdk::{Address, Env, Map, Vec};
+use soroban_sdk::{Address, Env, Map, Symbol, Vec};
 
 use crate::error::ContractError;
 use crate::math::{bps_of, mul_div, BPS_DENOMINATOR};
+
+// ---------------------------------------------------------------------------
+// Issue #955: Fee event tracking
+// ---------------------------------------------------------------------------
+
+/// Identifies which fee bucket an event refers to.
+///
+/// Kept as a small, explicit enum so emitted events carry a clear, indexable
+/// type discriminator rather than an opaque integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeType {
+    /// Platform fee retained by the contract/treasury.
+    Platform,
+    /// Fee owed to the invoice creator.
+    Creator,
+    /// Fee owed to the protocol treasury.
+    Protocol,
+}
+
+impl FeeType {
+    /// Stable, indexable symbol for this fee type (used in event topics).
+    pub fn as_symbol(&self) -> Symbol {
+        match self {
+            FeeType::Platform => Symbol::new(&Env::default(), "platform"),
+            FeeType::Creator => Symbol::new(&Env::default(), "creator"),
+            FeeType::Protocol => Symbol::new(&Env::default(), "protocol"),
+        }
+    }
+}
+
+/// Emit a `fee_calculated` event recording the computed fee for a given type.
+///
+/// Topics: `("fee_calculated", fee_type)` — the fee type is part of the topic
+/// so indexers can filter by fee type. Data: the computed `amount`.
+pub fn emit_fee_calculated(env: &Env, fee_type: FeeType, amount: i128) {
+    let topics = (Symbol::new(env, "fee_calculated"), fee_type.as_symbol());
+    env.events().publish(topics, amount);
+}
+
+/// Emit a `fee_distributed` event recording a fee transfer to a recipient.
+///
+/// Topics: `("fee_distributed", fee_type)` — indexable by fee type. Data: the
+/// `(recipient, amount)` pair, where `amount` must equal the amount actually
+/// transferred.
+pub fn emit_fee_distributed(env: &Env, fee_type: FeeType, recipient: &Address, amount: i128) {
+    let topics = (Symbol::new(env, "fee_distributed"), fee_type.as_symbol());
+    env.events().publish(topics, (recipient.clone(), amount));
+}
 
 /// Distribute `total` among recipients according to their `ratios` out of
 /// `denom`, using the largest-remainder method to handle rounding.
@@ -313,6 +361,49 @@ impl RefundReason {
     pub fn code(&self) -> u32 {
         *self as u32
     }
+}
+
+/// Compute the platform fee and emit a `fee_calculated` event for it.
+///
+/// The emitted amount is exactly the value returned, so off-chain indexers
+/// observe the same fee the contract will later distribute.
+pub fn calc_platform_fee_with_event(
+    env: &Env,
+    funded: i128,
+    fee_bps: u32,
+) -> Result<i128, ContractError> {
+    let fee = calc_platform_fee(funded, fee_bps)?;
+    emit_fee_calculated(env, FeeType::Platform, fee);
+    Ok(fee)
+}
+
+/// Compute a fee for the given `fee_type` from `funded` and `fee_bps`, emitting
+/// a `fee_calculated` event tagged with that type.
+///
+/// This is the generic entry point used by the distribution helpers so each
+/// fee bucket (platform, creator, protocol) produces its own typed event.
+pub fn calc_fee_with_event(
+    env: &Env,
+    fee_type: FeeType,
+    funded: i128,
+    fee_bps: u32,
+) -> Result<i128, ContractError> {
+    let fee = calc_platform_fee(funded, fee_bps)?;
+    emit_fee_calculated(env, fee_type, fee);
+    Ok(fee)
+}
+
+/// Distribute a computed fee to `recipient` and emit a `fee_distributed` event.
+///
+/// The emitted amount is exactly `amount`, which the caller must have already
+/// transferred to `recipient`, keeping the event in sync with the actual payout.
+pub fn distribute_fee_with_event(
+    env: &Env,
+    fee_type: FeeType,
+    recipient: &Address,
+    amount: i128,
+) {
+    emit_fee_distributed(env, fee_type, recipient, amount);
 }
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,29 @@ fn test_event_log_stores_creation_event() {
     let events = client.get_event_log(&invoice_id);
     assert!(events.len() > 0);
     assert_eq!(events.len(), 1);
+
+    // The creation event must be a detailed state-transition event.
+    let created = events.get(0).unwrap();
+    assert_eq!(created.event_type, Symbol::new(&env, "created"));
+    assert_eq!(created.ledger, env.ledger().sequence());
+
+    // Data map must carry the invoice id and the initial status.
+    let status_val = created.data.get(Symbol::new(&env, "status"));
+    assert!(status_val.is_some(), "created event must include status");
+    let status: InvoiceStatus = status_val.unwrap().into_val(&env);
+    assert_eq!(status, InvoiceStatus::Pending);
+
+    let id_val = created.data.get(Symbol::new(&env, "invoice_id"));
+    assert!(id_val.is_some(), "created event must include invoice_id");
+    let logged_id: u64 = id_val.unwrap().into_val(&env);
+    assert_eq!(logged_id, invoice_id);
+
+    // The event must also be emitted as a contract event for indexability.
+    let contract_events = env.events().all();
+    assert!(
+        contract_events.iter().any(|e| e.0 == contract_id),
+        "created event must be emitted from the contract for indexing"
+    );
 }
 
 #[test]
@@ -109,6 +132,47 @@ fn test_event_log_full_invoice_lifecycle() {
 
     let events = client.get_event_log(&invoice_id);
     assert!(events.len() >= 1);
+
+    // Every state transition must be logged with a distinct event type.
+    let mut saw_created = false;
+    let mut saw_paid = false;
+    let mut saw_released = false;
+    let mut last_ledger = 0_u32;
+    for i in 0..events.len() {
+        let ev = events.get(i).unwrap();
+        // Ledger numbers must be non-decreasing (indexable ordering).
+        assert!(ev.ledger >= last_ledger, "event ledgers must be ordered");
+        last_ledger = ev.ledger;
+
+        // Each event must carry the invoice id in its data map.
+        let id_val = ev.data.get(Symbol::new(&env, "invoice_id"));
+        assert!(id_val.is_some(), "event must include invoice_id");
+        let logged_id: u64 = id_val.unwrap().into_val(&env);
+        assert_eq!(logged_id, invoice_id);
+
+        if ev.event_type == Symbol::new(&env, "created") {
+            saw_created = true;
+        } else if ev.event_type == Symbol::new(&env, "paid") {
+            saw_paid = true;
+            // Payment events must include the amount paid.
+            let amount_val = ev.data.get(Symbol::new(&env, "amount"));
+            assert!(amount_val.is_some(), "paid event must include amount");
+            let amount: i128 = amount_val.unwrap().into_val(&env);
+            assert_eq!(amount, 100_i128);
+        } else if ev.event_type == Symbol::new(&env, "released") {
+            saw_released = true;
+        }
+    }
+    assert!(saw_created, "lifecycle must log created");
+    assert!(saw_paid, "lifecycle must log paid");
+    assert!(saw_released, "lifecycle must log released");
+
+    // Contract events must be emitted for each transition (indexable).
+    let contract_events = env.events().all();
+    assert!(
+        contract_events.iter().filter(|e| e.0 == contract_id).count() >= 3,
+        "each transition must emit a contract event"
+    );
 }
 
 #[test]
@@ -466,4 +530,77 @@ fn fee_paid_event_carries_amount_and_treasury() {
 
     assert_eq!(data.0, expected_amount, "amount should match");
     assert_eq!(data.1, treasury, "treasury should match");
+
+    // Topics must be indexable: event name plus fee type.
+    assert!(!topics.is_empty(), "fee event must have topics");
+    assert_eq!(topics.get(0).unwrap(), Symbol::new(&env, "fee_paid"));
+    assert!(
+        topics.iter().any(|t| t == Symbol::new(&env, "distribution")),
+        "fee_paid must be tagged with the distribution fee type"
+    );
+}
+
+#[test]
+fn fee_calculated_event_carries_amount_and_type() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let expected_amount: i128 = 250;
+    env.ledger().set_sequence(50);
+
+    split_contracts::events::fee_calculated(&env, 7, expected_amount, Symbol::new(&env, "platform"));
+
+    let events = env.events().all();
+    assert!(!events.is_empty(), "should have at least one event");
+
+    let fee_event = events.last().expect("should have fee_calculated event");
+    let (topics, data): (Vec<Symbol>, (i128, Symbol, u32)) = fee_event.parsed_data();
+
+    assert_eq!(data.0, expected_amount, "calculated amount should match");
+    assert_eq!(data.1, Symbol::new(&env, "platform"), "fee type should match");
+
+    // Topics must be indexable: event name plus fee type.
+    assert!(!topics.is_empty(), "fee event must have topics");
+    assert_eq!(topics.get(0).unwrap(), Symbol::new(&env, "fee_calculated"));
+    assert!(
+        topics.iter().any(|t| t == Symbol::new(&env, "platform")),
+        "fee_calculated must be tagged with the platform fee type"
+    );
+}
+
+#[test]
+fn fee_events_emitted_per_fee_type_with_matching_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let treasury = Address::generate(&env);
+    let platform_amount: i128 = 300;
+    let distribution_amount: i128 = 200;
+
+    env.ledger().set_sequence(10);
+    split_contracts::events::fee_calculated(&env, 1, platform_amount, Symbol::new(&env, "platform"));
+    split_contracts::events::fee_calculated(&env, 1, distribution_amount, Symbol::new(&env, "distribution"));
+    split_contracts::events::fee_paid(&env, 1, distribution_amount, &treasury);
+
+    let events = env.events().all();
+    assert!(events.len() >= 3, "each fee type must emit its own event");
+
+    // Verify the calculated amounts match the computed values per fee type.
+    let mut platform_seen = false;
+    let mut distribution_seen = false;
+    for i in 0..events.len() {
+        let ev = events.get(i).unwrap();
+        let (topics, data): (Vec<Symbol>, (i128, Symbol, u32)) = ev.parsed_data();
+        if topics.get(0).unwrap() == Symbol::new(&env, "fee_calculated") {
+            if data.1 == Symbol::new(&env, "platform") {
+                assert_eq!(data.0, platform_amount);
+                platform_seen = true;
+            } else if data.1 == Symbol::new(&env, "distribution") {
+                assert_eq!(data.0, distribution_amount);
+                distribution_seen = true;
+            }
+        }
+    }
+    assert!(platform_seen, "platform fee calculation must be emitted");
+    assert!(distribution_seen, "distribution fee calculation must be emitted");
 }

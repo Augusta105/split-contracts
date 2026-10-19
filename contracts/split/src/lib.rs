@@ -594,6 +594,50 @@ fn set_created_ledger(env: &Env, id: u64) {
 fn invoice_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("inv"), id)
 }
+
+/// Issue #942: temporary-storage key for the in-memory `InvoiceExt` cache.
+/// Holds a `Map<u64, InvoiceExt>` so a single read/write covers all invoices
+/// touched within one invocation. Temporary storage is cleared automatically
+/// at the end of the transaction, giving us a per-call cache for free.
+fn invoice_ext_cache_key() -> Symbol {
+    symbol_short!("iext_cch")
+}
+
+/// Issue #942: read the cached `InvoiceExt` map (empty if absent).
+fn load_invoice_ext_cache(env: &Env) -> Map<u64, InvoiceExt> {
+    env.storage()
+        .temporary()
+        .get(&invoice_ext_cache_key())
+        .unwrap_or_else(|| Map::new(env))
+}
+
+/// Issue #942: lazily load `InvoiceExt` for `id`, caching the result in
+/// temporary storage so repeated reads within the same invocation hit the
+/// cache instead of persistent storage.
+fn load_invoice_ext_lazy(env: &Env, id: u64) -> InvoiceExt {
+    let mut cache = load_invoice_ext_cache(env);
+    if let Some(ext) = cache.get(id) {
+        return ext;
+    }
+    let ext: InvoiceExt = env
+        .storage()
+        .persistent()
+        .get(&invoice_ext_key(id))
+        .unwrap_or_else(|| InvoiceExt::default_for(env));
+    cache.set(id, ext.clone());
+    env.storage().temporary().set(&invoice_ext_cache_key(), &cache);
+    ext
+}
+
+/// Issue #942: drop the cached `InvoiceExt` for `id` so the next lazy read
+/// observes the freshly written value.
+fn invalidate_invoice_ext_cache(env: &Env, id: u64) {
+    let mut cache = load_invoice_ext_cache(env);
+    if cache.contains_key(id) {
+        cache.remove(id);
+        env.storage().temporary().set(&invoice_ext_cache_key(), &cache);
+    }
+}
 fn invoice_ext_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("inv_ext"), id)
 }
@@ -12553,6 +12597,7 @@ impl SplitContract {
         };
 
         save_invoice(&env, id, &new_invoice);
+        invalidate_invoice_ext_cache(&env, id);
         env.storage()
             .persistent()
             .set(&renewed_to_key(old_invoice_id), &id);
@@ -12595,6 +12640,7 @@ impl SplitContract {
 
         invoice.refunded_addresses.push_back(payer.clone());
         save_invoice(&env, old_invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, old_invoice_id);
         events::payer_refunded(&env, old_invoice_id, &payer, amount);
     }
 
@@ -12676,6 +12722,7 @@ impl SplitContract {
             amount,
         });
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         append_audit_entry(&env, invoice_id, symbol_short!("bid"), &bidder);
     }
 
@@ -12732,6 +12779,15 @@ impl SplitContract {
                 &InvoiceStatus::Refunded,
                 &env.current_contract_address(),
             );
+            events::invoice_transition(
+                &env,
+                invoice_id,
+                symbol_short!("auction"),
+                &InvoiceStatus::Pending,
+                &InvoiceStatus::Refunded,
+                &env.current_contract_address(),
+                invoice.funded,
+            );
             append_audit_entry(
                 &env,
                 invoice_id,
@@ -12769,6 +12825,15 @@ impl SplitContract {
             Some(&InvoiceStatus::Pending),
             &InvoiceStatus::Refunded,
             &env.current_contract_address(),
+        );
+        events::invoice_transition(
+            &env,
+            invoice_id,
+            symbol_short!("auction"),
+            &InvoiceStatus::Pending,
+            &InvoiceStatus::Refunded,
+            &env.current_contract_address(),
+            total_refunded_amount,
         );
         append_audit_entry(
             &env,
@@ -12904,6 +12969,15 @@ impl SplitContract {
                 &InvoiceStatus::Refunded,
                 &caller,
             );
+            events::invoice_transition(
+                &env,
+                invoice_id,
+                symbol_short!("cancel"),
+                &InvoiceStatus::Pending,
+                &InvoiceStatus::Refunded,
+                &caller,
+                total_refunded_amount,
+            );
             maybe_record_refunded(&env, &invoice.creator);
 
             // Increment total_refunded counter (issue #28).
@@ -12940,6 +13014,15 @@ impl SplitContract {
                 &InvoiceStatus::Cancelled,
                 &caller,
             );
+            events::invoice_transition(
+                &env,
+                invoice_id,
+                symbol_short!("cancel"),
+                &InvoiceStatus::Pending,
+                &InvoiceStatus::Cancelled,
+                &caller,
+                0,
+            );
         }
 
         // Issue #503: decrement per-creator open-invoice counter on cancel.
@@ -12955,6 +13038,7 @@ impl SplitContract {
         }
 
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         append_audit_entry(&env, invoice_id, symbol_short!("cancel"), &caller);
 
         // Issue: increment per-creator cancel count for cancellation rate tracking.
@@ -12997,8 +13081,19 @@ impl SplitContract {
         assert!(!invoice.disputed, "invoice is disputed");
 
         invoice.creator.require_auth();
-        invoice.creator = new_creator;
+        let old_creator = invoice.creator.clone();
+        invoice.creator = new_creator.clone();
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
+        events::invoice_transition(
+            &env,
+            invoice_id,
+            symbol_short!("transfer"),
+            &InvoiceStatus::Pending,
+            &InvoiceStatus::Pending,
+            &old_creator,
+            0,
+        );
     }
 
     /// Extend the deadline for an invoice. Callable by the creator or an assigned delegate.
@@ -13035,6 +13130,7 @@ impl SplitContract {
         let old_deadline = invoice.deadline;
         invoice.deadline = new_deadline;
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         append_audit_entry(&env, invoice_id, symbol_short!("extend"), &caller);
         events::deadline_extended(&env, invoice_id, old_deadline, new_deadline);
     }
@@ -13144,17 +13240,28 @@ impl SplitContract {
         let mut new_invoice = load_invoice(&env, new_id);
         new_invoice.funded = old_invoice.funded;
         save_invoice(&env, new_id, &new_invoice);
+        invalidate_invoice_ext_cache(&env, new_id);
 
         // Mark old invoice as Refunded without transferring tokens.
         old_invoice.status = InvoiceStatus::Refunded;
         old_invoice.completion_time = Some(env.ledger().timestamp());
         save_invoice(&env, invoice_id, &old_invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         events::invoice_state_changed(
             &env,
             invoice_id,
             Some(&InvoiceStatus::Pending),
             &InvoiceStatus::Refunded,
             &caller,
+        );
+        events::invoice_transition(
+            &env,
+            invoice_id,
+            symbol_short!("rollover"),
+            &InvoiceStatus::Pending,
+            &InvoiceStatus::Refunded,
+            &caller,
+            old_invoice.funded,
         );
 
         append_audit_entry(&env, invoice_id, symbol_short!("rollover"), &caller);
@@ -13211,6 +13318,7 @@ impl SplitContract {
         invoice.claimed.push_back(0i128);
 
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         append_audit_entry(&env, invoice_id, symbol_short!("add_rec"), &caller);
         events::recipient_added(&env, invoice_id, &recipient, amount);
 
@@ -13263,6 +13371,7 @@ impl SplitContract {
 
         invoice.amounts = new_amounts;
         save_invoice(&env, invoice_id, &invoice);
+        invalidate_invoice_ext_cache(&env, invoice_id);
         append_audit_entry(&env, invoice_id, symbol_short!("adj_spl"), &caller);
         events::split_adjusted(&env, invoice_id, &caller);
     }
@@ -17638,6 +17747,15 @@ impl SplitContract {
         );
 
         events::invoice_from_template(&env, invoice_id, &creator, template_id);
+        events::invoice_transition(
+            &env,
+            invoice_id,
+            symbol_short!("tmpl"),
+            &InvoiceStatus::Pending,
+            &InvoiceStatus::Pending,
+            &creator,
+            0,
+        );
 
         invoice_id
     }
@@ -17657,6 +17775,9 @@ impl SplitContract {
     /// expiration during long-running campaigns or dispute periods.
     pub fn bump_invoice_ttl(env: Env, invoice_id: u64) {
         let _invoice = load_invoice(&env, invoice_id);
+
+        // Issue #942: warm the lazy cache so subsequent reads in this call hit it.
+        let _ext = load_invoice_ext_lazy(&env, invoice_id);
 
         // Bump TTL for all known invoice keys
         let min_ttl = constants::MIN_INVOICE_TTL_LEDGERS;

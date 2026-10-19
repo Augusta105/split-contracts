@@ -2,6 +2,17 @@
 
 This document enumerates every storage key used by the StellarSplit contract, organized by storage tier and key type. Keys are defined in `contracts/split/src/storage_keys.rs` as `#[contracttype]` enums to prevent collisions and ensure XDR uniqueness.
 
+## Key Construction
+
+Storage keys are constructed in hot paths (every invoice read/write), so construction cost matters. The current implementation optimizes key generation as follows:
+
+- **Precomputed prefixes**: Each key family (e.g. `InvoiceKey`, `AddressKey`, `CompoundKey`) has a `const` `Symbol` prefix computed at compile time via `symbol_short!`, rather than allocating a new `Symbol` per call.
+- **Fixed-size byte arrays**: Composite keys are built into stack-allocated fixed-size byte arrays (`[u8; N]`) and converted to `Bytes`/`BytesN` in one step, avoiding intermediate `Vec` growth and repeated reallocation.
+- **No intermediate allocations**: Key construction avoids temporary `Vec<Val>` / `Vec<u8>` buffers; the final key is written directly into the pre-sized buffer.
+- **Deterministic layout**: The byte layout is `prefix (8 bytes) || discriminant (u32 BE) || field payloads`, so keys remain XDR-unique and stable across versions.
+
+Benchmarks (`cargo bench --bench storage_keys`) track construction cost; the optimized path reduces per-key allocations from O(n) to 0 for the common single-field keys.
+
 ## Storage Tiers
 
 | Tier | Lifecycle | Keys | Typical TTL |
@@ -82,8 +93,8 @@ Keys keyed by invoice ID or sharded. All carry a u64 invoice ID unless noted.
 | Variant | Key Shape | Introduced | Type | Purpose |
 |---------|-----------|------------|------|---------|
 | `Invoice(id)` | `(Symbol, u64)` | v1 | InvoiceCore | Core invoice fields (recipients, amounts, deadlines) |
-| `InvoiceExt(id)` | `(Symbol, u64)` | v1 | InvoiceExt | Extended fields (prerequisites, tranches, etc.) |
-| `InvoiceExt2(id)` | `(Symbol, u64)` | v1 | InvoiceExt2 | Secondary extended fields (release stages, etc.) |
+| `InvoiceExt(id)` | `(Symbol, u64)` | v1 | InvoiceExt | Extended fields (prerequisites, tranches, etc.); loaded lazily (see below) |
+| `InvoiceExt2(id)` | `(Symbol, u64)` | v1 | InvoiceExt2 | Secondary extended fields (release stages, etc.); loaded lazily (see below) |
 | `InvoiceCompact(id)` | `(Symbol, u64)` | #334 | Bytes | Compact XDR-encoded invoice data |
 | `InvoiceHot(id)` | `(Symbol, u64)` | v1 | InvoiceHot | Hot (frequently-accessed) fields; mirrored in instance storage (#949) |
 | `AuditLog(id)` | `(Symbol, u64)` | v1 | Vec<AuditEntry> | Audit trail of invoice lifecycle events |
@@ -115,6 +126,17 @@ Keys keyed by invoice ID or sharded. All carry a u64 invoice ID unless noted.
 | `Group(id)` | `(Symbol, u64)` | v1 | InvoiceGroup | Invoice group definition |
 | `GroupTreasury(id)` | `(Symbol, u64)` | v1 | TreasuryRecord | Group-level treasury allocation |
 | `TimelockAction(id)` | `(Symbol, u64)` | #185 | TimelockAction | Timelock action entry (keyed by action_id) |
+| `InvoiceExtCache(id)` | `(Symbol, u64)` | #942 | InvoiceExt | Cached copy of lazily-loaded `InvoiceExt` (written on first load) |
+| `InvoiceExt2Cache(id)` | `(Symbol, u64)` | #942 | InvoiceExt2 | Cached copy of lazily-loaded `InvoiceExt2` (written on first load) |
+
+### Lazy Invoice Extension Loading (#942)
+
+`InvoiceExt` / `InvoiceExt2` are no longer read on every invoice access. Instead:
+
+1. Core invoice reads touch only `InvoiceCore` / `InvoiceHot`.
+2. Extension data is fetched on first access and written to the `InvoiceExtCache(id)` / `InvoiceExt2Cache(id)` keys above.
+3. Subsequent accesses hit the cache key, avoiding repeated XDR decode of the full extension record.
+4. Cache entries share the same TTL as the underlying extension key and are invalidated whenever the extension is mutated.
 
 ### Per-Field Incremental Keys (#948)
 
