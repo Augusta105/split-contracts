@@ -62,7 +62,7 @@ pub struct ComputeEstimate {
 
 ## 3. Resource Ranges
 
-The table below lists measured typical resource consumption ranges across supported operations:
+The table below lists measured typical resource consumption ranges across supported operations after the fixed-point math (#947), incremental state update (#948), and storage tier optimization (#949) changes:
 
 | Operation | CPU Instructions Range | Memory Range (Bytes) | Typical Fee Range (Stroops) |
 |---|---|---|---|

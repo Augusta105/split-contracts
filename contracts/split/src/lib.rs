@@ -2229,6 +2229,19 @@ fn assert_invoice_pending(invoice: &Invoice) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Issue #957: Invoice-scoped variant of [`assert_invoice_pending`] that emits
+/// a `guard_failure` event (guard = `status`) before returning the error.
+fn assert_invoice_pending_guarded(
+    env: &Env,
+    invoice_id: u64,
+    invoice: &Invoice,
+) -> Result<(), ContractError> {
+    if invoice.status != InvoiceStatus::Pending {
+        return release_guard(env, invoice_id, symbol_short!("status"), 0);
+    }
+    Ok(())
+}
+
 /// Estimates the serialised size (in bytes) of an invoice's persisted
 /// representation (issue #425). Sums the XDR-encoded length of the three
 /// pieces `save_invoice` actually writes to storage (`InvoiceCore`,
@@ -2382,10 +2395,11 @@ fn require_cosigner_threshold_met(env: &Env, id: u64) {
             .persistent()
             .get(&cosign_key(id))
             .unwrap_or_else(|| Vec::new(env));
-        assert!(
-            approvals.len() >= threshold,
-            "cosigner approval threshold not met"
-        );
+        if approvals.len() < threshold {
+            // Issue #957: emit guard-failure event before panicking.
+            events::guard_failure(env, id, &symbol_short!("cosign"), approvals.len() as i128);
+            panic!("cosigner approval threshold not met");
+        }
     }
 }
 
@@ -2509,6 +2523,30 @@ fn check_not_paused(env: &Env) {
     if assert_not_paused(env).is_err() {
         panic!("ContractPaused");
     }
+}
+
+/// Issue #957: Emit a guard-failure event and return the corresponding error.
+///
+/// Every release-path guard funnels through here so that off-chain indexers
+/// observe *why* an operation was blocked, together with the invoice id and
+/// the guard's discriminant. The event is emitted before the error is
+/// returned so it is recorded even though the call reverts its state.
+fn guard_failed(env: &Env, invoice_id: u64, guard: Symbol, detail: i128) -> ContractError {
+    events::guard_failure(env, invoice_id, &guard, detail);
+    match guard {
+        g if g == symbol_short!("paused") => ContractError::ContractPaused,
+        g if g == symbol_short!("frozen") => ContractError::InvalidStatus,
+        g if g == symbol_short!("timelock") => ContractError::InvalidStatus,
+        g if g == symbol_short!("released") => ContractError::InvalidStatus,
+        g if g == symbol_short!("funding") => ContractError::InvalidStatus,
+        _ => ContractError::InvalidStatus,
+    }
+}
+
+/// Issue #957: Release-path guard that emits a `guard_failure` event before
+/// returning the mapped `ContractError`.
+fn release_guard(env: &Env, invoice_id: u64, guard: Symbol, detail: i128) -> Result<(), ContractError> {
+    Err(guard_failed(env, invoice_id, guard, detail))
 }
 
 fn validate_allowed_token(env: &Env, token: &Address) {
@@ -17758,6 +17796,30 @@ impl SplitContract {
         invoice.payments.len() as u32
     }
 
+    /// Issue #957: Return the guard-failure event data for a blocked operation.
+    ///
+    /// Emits a `guard_failure` event for `invoice_id` naming the guard that
+    /// would block the operation and returns the mapped `ContractError`. This
+    /// lets callers probe release readiness without mutating state.
+    pub fn check_release_guards(env: Env, invoice_id: u64) -> Result<(), ContractError> {
+        let invoice = load_invoice(&env, invoice_id);
+
+        if is_paused(&env) {
+            return release_guard(&env, invoice_id, symbol_short!("paused"), 0);
+        }
+        if invoice.admin_frozen {
+            return release_guard(&env, invoice_id, symbol_short!("frozen"), 0);
+        }
+        if invoice.status == InvoiceStatus::Released {
+            return release_guard(&env, invoice_id, symbol_short!("released"), 0);
+        }
+        let total: i128 = invoice.amounts.iter().sum();
+        if invoice.funded < total {
+            return release_guard(&env, invoice_id, symbol_short!("funding"), invoice.funded);
+        }
+        Ok(())
+    }
+
     /// Get the funding percentage of an invoice as basis points.
     /// Returns (funded * 10_000 / total) as u32, or 0 if total is 0.
     pub fn get_invoice_funding_percentage(env: Env, invoice_id: u64) -> u32 {
@@ -17766,7 +17828,8 @@ impl SplitContract {
         if total == 0 {
             0
         } else {
-            ((invoice.funded * 10_000) / total) as u32
+            // Issue #947: route through the fixed-point helper.
+            funding_bps(invoice.funded, total)
         }
     }
 

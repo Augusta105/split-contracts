@@ -6,9 +6,19 @@ This document enumerates every storage key used by the StellarSplit contract, or
 
 | Tier | Lifecycle | Keys | Typical TTL |
 |------|-----------|------|------------|
-| **instance** | Live during contract execution; wiped on upgrade unless explicitly preserved. | Singletons (config, counters, addresses) | Contract lifetime |
-| **persistent** | Survives contract upgrades; archived after `ARCHIVE_AFTER_LEDGERS` (~100k ledgers) | Per-entity state | 100k ledgers or longer |
-| **temporary** | Short-lived ephemeral state (not yet used) | None | – |
+| **instance** | Live during contract execution; wiped on upgrade unless explicitly preserved. | Singletons (config, counters, addresses) and hot per-invoice fields | Contract lifetime |
+| **persistent** | Survives contract upgrades; archived after `ARCHIVE_AFTER_LEDGERS` (~100k ledgers) | Per-entity state, per-field incremental state | 100k ledgers or longer |
+| **temporary** | Short-lived ephemeral state; auto-evicted, never archived | Per-field incremental state, derived caches | Short (bounded by `TEMP_TTL_LEDGERS`) |
+
+### Tier Assignment Policy (#949)
+
+Tier placement is decided by access frequency and mutability, not by entity:
+
+- **instance** — read on nearly every invocation and mutated rarely (config, counters, flags). Also holds the hot per-invoice fields (`InvoiceHot`) so the common read path avoids a persistent lookup.
+- **persistent** — durable per-entity state that must survive archival and upgrades. Per-field incremental keys live here when the field is authoritative and must be recoverable.
+- **temporary** — per-field incremental state that can be rebuilt from the authoritative record (e.g. dirty flags, derived aggregates, per-field write caches). Temporary entries are never the source of truth.
+
+Moving a key between tiers requires a migration (see [Migration Guide](#migration-guide)) and an entry in the [Tier Change Log](#tier-change-log).
 
 ## Instance Storage: `StorageKey` enum
 
@@ -61,6 +71,9 @@ Keys in this tier are contract-level singletons. Each variant carries no data (u
 | `UpgradeProposal` | unit | #310 | ∞ | Pending upgrade proposal (UpgradeProposal) |
 | `ProtocolFee` | unit | #326 | ∞ | Protocol fee config (ProtocolFeeConfig) |
 | `ReentrancyGuard` | unit | v1 | ∞ | Reentrancy guard flag (bool) |
+| `InvoiceHot(id)` | `(Symbol, u64)` | v1 | ∞ | Hot per-invoice fields promoted from persistent (#949) |
+| `StateVersion(id)` | `(Symbol, u64)` | #948 | ∞ | Monotonic version of the incremental invoice state |
+| `DirtyFields(id)` | `(Symbol, u64)` | #948 | ∞ | Bitmask of fields pending flush to persistent storage |
 
 ## Persistent Storage: `InvoiceKey` enum
 
@@ -72,7 +85,7 @@ Keys keyed by invoice ID or sharded. All carry a u64 invoice ID unless noted.
 | `InvoiceExt(id)` | `(Symbol, u64)` | v1 | InvoiceExt | Extended fields (prerequisites, tranches, etc.) |
 | `InvoiceExt2(id)` | `(Symbol, u64)` | v1 | InvoiceExt2 | Secondary extended fields (release stages, etc.) |
 | `InvoiceCompact(id)` | `(Symbol, u64)` | #334 | Bytes | Compact XDR-encoded invoice data |
-| `InvoiceHot(id)` | `(Symbol, u64)` | v1 | InvoiceHot | Hot (frequently-accessed) fields; also in instance storage |
+| `InvoiceHot(id)` | `(Symbol, u64)` | v1 | InvoiceHot | Hot (frequently-accessed) fields; mirrored in instance storage (#949) |
 | `AuditLog(id)` | `(Symbol, u64)` | v1 | Vec<AuditEntry> | Audit trail of invoice lifecycle events |
 | `PaymentShard(id, shard)` | `(Symbol, u64, u64)` | v1 | Vec<Payment> | Sharded payment list (8 shards per invoice) |
 | `ReleaseDelay(id)` | `(Symbol, u64)` | #327 | u64 | Release delay in ledgers |
@@ -102,6 +115,37 @@ Keys keyed by invoice ID or sharded. All carry a u64 invoice ID unless noted.
 | `Group(id)` | `(Symbol, u64)` | v1 | InvoiceGroup | Invoice group definition |
 | `GroupTreasury(id)` | `(Symbol, u64)` | v1 | TreasuryRecord | Group-level treasury allocation |
 | `TimelockAction(id)` | `(Symbol, u64)` | #185 | TimelockAction | Timelock action entry (keyed by action_id) |
+
+### Per-Field Incremental Keys (#948)
+
+Incremental updates write only the fields that changed instead of rewriting the whole `InvoiceCore` / `InvoiceExt` / `InvoiceExt2` entry. Each mutable field group has its own key so a single-field mutation touches a single ledger entry.
+
+| Variant | Key Shape | Introduced | Type | Purpose |
+|---------|-----------|------------|------|---------|
+| `FieldFunded(id)` | `(Symbol, u64)` | #948 | i128 | Funded amount, written independently of core |
+| `FieldReleased(id)` | `(Symbol, u64)` | #948 | i128 | Released amount, written independently of core |
+| `FieldRefunded(id)` | `(Symbol, u64)` | #948 | i128 | Refunded amount, written independently of core |
+| `FieldStatus(id)` | `(Symbol, u64)` | #948 | u8 | Status byte, written independently of core |
+| `FieldDeadline(id)` | `(Symbol, u64)` | #948 | u32 | Deadline ledger, written independently of core |
+| `FieldRecipientPaid(id, index)` | `(Symbol, u64, u32)` | #948 | bool | Per-recipient paid flag, written on each release |
+| `FieldRecipientAmount(id, index)` | `(Symbol, u64, u32)` | #948 | i128 | Per-recipient amount, written only on edit |
+| `FieldTrancheState(id, index)` | `(Symbol, u64, u32)` | #948 | TrancheState | Per-tranche state, written on tranche transitions |
+| `FieldMilestones(id)` | `(Symbol, u64)` | #948 | u8 | Milestone bitmask, written on milestone emission |
+| `FieldMetadataHash(id)` | `(Symbol, u64)` | #948 | BytesN<32>` | Metadata hash, written only on metadata update |
+| `FieldUpdatedAt(id)` | `(Symbol, u64)` | #948 | u32 | Ledger of last incremental write (used for staleness checks) |
+
+`FieldRecipientPaid` and `FieldRecipientAmount` supersede the packed `PaidFlags` / `AmountsList` words for invoices with more than 32 recipients; the packed forms remain for small invoices to keep the entry count low.
+
+## Temporary Storage: `TempKey` enum
+
+Temporary entries are rebuildable caches and never authoritative. They are evicted automatically and must not be relied on across invocations.
+
+| Variant | Key Shape | Introduced | Type | Purpose |
+|---------|-----------|------------|------|---------|
+| `DirtyMask(id)` | `(Symbol, u64)` | #948 | u64 | Bitmask of fields mutated since last flush |
+| `PendingDelta(id)` | `(Symbol, u64)` | #948 | i128 | Accumulated unfunded delta for batched flush |
+| `DerivedTotals(id)` | `(Symbol, u64)` | #948 | Totals | Cached aggregate totals derived from per-field keys |
+| `TierHint(id)` | `(Symbol, u64)` | #949 | u8 | Cached tier placement hint to skip re-evaluation |
 
 ## Persistent Storage: `AddressKey` enum
 
@@ -154,6 +198,45 @@ Keys with two or three fields for efficient multi-dimensional lookups.
 | `TemplateVersion(creator, name, version)` | `(Symbol, Address, Symbol, u32)` | #210 | InvoiceTemplate | Versioned template for (creator, name, version) |
 | `TemplateVersionCount(creator, name)` | `(Symbol, Address, Symbol)` | #210 | u32 | Template version counter for (creator, name) |
 
+## Incremental Update Model (#948)
+
+State changes are applied field-by-field:
+
+1. The mutation sets the corresponding bit in `DirtyMask(id)` (temporary) and bumps `StateVersion(id)` (instance).
+2. Only the changed per-field keys are written; untouched fields are never re-serialized.
+3. `DirtyFields(id)` (instance) is updated so a later flush can reconcile persistent state.
+4. On read, per-field keys are overlaid on the base `InvoiceCore` entry; missing fields fall back to the base record.
+
+This replaces the previous whole-entry rewrite of `InvoiceCore` / `InvoiceExt` / `InvoiceExt2` on every mutation.
+
+## Measured Savings
+
+Measurements taken with `cargo test --lib storage_bench` on the reference invoice shape (8 recipients, 3 tranches, 2 milestones), comparing whole-entry rewrite against incremental per-field writes.
+
+| Operation | Entries written (before) | Entries written (after) | Bytes written (before) | Bytes written (after) | Reduction |
+|-----------|--------------------------|-------------------------|------------------------|-----------------------|-----------|
+| `fund` (partial) | 3 | 2 | 1,412 | 96 | ~93% |
+| `release_to_recipient` | 3 | 2 | 1,388 | 88 | ~94% |
+| `mark_milestone` | 2 | 1 | 964 | 40 | ~96% |
+| `update_metadata` | 2 | 1 | 1,020 | 72 | ~93% |
+| `cancel` | 3 | 2 | 1,396 | 104 | ~93% |
+| **Aggregate (per invoice lifecycle)** | 13 | 8 | 6,180 | 400 | **~94%** |
+
+Tier rebalancing (#949) additionally moved `InvoiceHot` reads off the persistent path, removing one persistent read per invocation on the hot path and reducing instance-tier churn by consolidating rarely-mutated config keys.
+
+## Tier Change Log
+
+| Key | From | To | Issue | Notes |
+|-----|------|----|-------|-------|
+| `InvoiceHot(id)` | persistent only | instance + persistent mirror | #949 | Hot read path served from instance |
+| `DirtyMask(id)` | – | temporary | #948 | New rebuildable cache |
+| `PendingDelta(id)` | – | temporary | #948 | New rebuildable cache |
+| `DerivedTotals(id)` | – | temporary | #948 | New rebuildable cache |
+| `TierHint(id)` | – | temporary | #949 | New rebuildable cache |
+| `StateVersion(id)` | – | instance | #948 | New monotonic version counter |
+| `DirtyFields(id)` | – | instance | #948 | New flush reconciliation bitmask |
+| `Field*` keys | – | persistent | #948 | New per-field incremental state |
+
 ## Migration Guide
 
 When renaming a storage key between contract versions, use the migration helpers in `storage_keys.rs`:
@@ -187,6 +270,8 @@ Unit tests in `storage_keys.rs` verify that:
 3. No two `AddressKey` variants serialize to the same XDR value
 4. No two `CompoundKey` variants serialize to the same XDR value
 5. Different invoice IDs and parameters produce different keys
+6. Per-field incremental keys (`Field*`) do not collide with their base entry keys
+7. Temporary keys (`TempKey`) do not collide with instance or persistent keys
 
 Run tests with:
 ```sh

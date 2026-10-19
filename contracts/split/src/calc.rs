@@ -37,6 +37,7 @@ use crate::types::BASIS_POINTS_TOTAL;
 use soroban_sdk::{Address, Env, Map, Vec};
 
 use crate::error::ContractError;
+use crate::math::{bps_of, mul_div, BPS_DENOMINATOR};
 
 /// Distribute `total` among recipients according to their `ratios` out of
 /// `denom`, using the largest-remainder method to handle rounding.
@@ -75,13 +76,18 @@ pub fn distribute_with_remainder(
 
     let n = ratios.len() as usize;
 
-    // Compute floor shares and remainders.
+    // Compute floor shares and remainders using fixed-point helpers.
+    // `mul_div` performs the same floor division as `total * r / denom` but
+    // guards against intermediate overflow, and `mul_mod` gives the exact
+    // remainder needed for the largest-remainder step.
     let mut shares = Vec::new(env);
     let mut remainders = Vec::new(env);
 
     for r in ratios.iter() {
-        shares.push_back(total * r / denom);
-        remainders.push_back(total * r % denom);
+        let share = mul_div(total, r, denom)?;
+        let rem = mul_mod(total, r, denom)?;
+        shares.push_back(share);
+        remainders.push_back(rem);
     }
 
     // How many extra stroops to distribute?
@@ -196,8 +202,9 @@ pub fn funding_bps(funded: i128, total: i128) -> u32 {
     if funded >= total {
         return 10_000;
     }
-    // funded < total, both positive — safe to cast to u128 and divide.
-    let bps = (funded as u128 * 10_000u128) / (total as u128);
+    // funded < total, both positive — fixed-point helper computes
+    // `funded * 10_000 / total` with overflow-safe intermediate math.
+    let bps = bps_of(funded, total);
     // bps is in [0, 9_999] since funded < total; the clamp is a safeguard.
     bps.min(10_000) as u32
 }
@@ -222,11 +229,9 @@ pub fn calc_platform_fee(funded: i128, fee_bps: u32) -> Result<i128, ContractErr
     if fee_bps == 0 || funded == 0 {
         return Ok(0);
     }
-    let fee = (funded as i128)
-        .checked_mul(fee_bps as i128)
-        .ok_or(ContractError::ArithmeticOverflow)?
-        / 10_000;
-    Ok(fee)
+    // `mul_div` computes `funded * fee_bps / 10_000` with overflow-safe
+    // intermediate arithmetic, preserving the previous checked-mul semantics.
+    mul_div(funded, fee_bps as i128, BPS_DENOMINATOR)
 }
 
 // ---------------------------------------------------------------------------
