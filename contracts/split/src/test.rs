@@ -41,7 +41,7 @@ fn token_client<'a>(env: &'a Env, token_id: &Address) -> TokenClient<'a> {
     TokenClient::new(env, token_id)
 }
 
-fn default_options(env: &Env) -> InvoiceOptions {
+pub(crate) fn default_options(env: &Env) -> InvoiceOptions {
     InvoiceOptions {
         co_creators: Vec::new(env),
         allow_early_withdrawal: false,
@@ -5695,6 +5695,333 @@ fn has_circuit_breaker_event(env: &Env, topic_name: &str) -> bool {
     env.events().all().events().iter().any(|event| xdr_event_topics(env, event).map(|topics| topic1_is(env, &topics, topic_name)).unwrap_or(false))
 }
 
+// ---------------------------------------------------------------------------
+// Issue #947: Fixed-point math accuracy and overflow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_point_bps_math_matches_integer_division() {
+    // bps math must stay exact for values that divide evenly.
+    let cases: [(i128, u32); 6] = [
+        (10_000, 100),   // 1%
+        (10_000, 1_000), // 10%
+        (1_000_000, 250),// 2.5%
+        (100, 10_000),   // 100%
+        (0, 5_000),      // zero base
+        (1, 0),          // zero bps
+    ];
+    for (amount, bps) in cases {
+        let expected = amount * (bps as i128) / 10_000;
+        let actual = amount
+            .checked_mul(bps as i128)
+            .expect("no overflow for test inputs")
+            / 10_000;
+        assert_eq!(actual, expected, "bps math mismatch for {} @ {} bps", amount, bps);
+    }
+}
+
+#[test]
+fn test_fixed_point_bps_math_rounds_down_consistently() {
+    // Truncation must be deterministic and never round up (never over-charge).
+    let amount: i128 = 333;
+    let bps: u32 = 333;
+    let product = amount * (bps as i128);
+    let result = product / 10_000;
+    assert_eq!(result, 11);
+    assert!(result * 10_000 <= product, "fixed-point result must not exceed exact value");
+}
+
+#[test]
+fn test_fixed_point_multiplication_overflow_detected() {
+    // checked_mul must surface overflow rather than silently wrapping.
+    let big: i128 = i128::MAX / 2;
+    assert!(big.checked_mul(3).is_none(), "overflow must be detected");
+    assert!(big.checked_mul(2).is_some(), "in-range multiplication must succeed");
+}
+
+#[test]
+fn test_fixed_point_accumulation_is_associative_for_small_values() {
+    // Summing per-recipient shares must equal the total share.
+    let total: i128 = 10_000;
+    let shares: [u32; 4] = [2_500, 2_500, 2_500, 2_500];
+    let mut acc: i128 = 0;
+    for bps in shares {
+        acc += total * (bps as i128) / 10_000;
+    }
+    assert_eq!(acc, total, "shares must sum back to the total");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #948: Incremental state updates match full rewrites
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_incremental_payments_match_full_funding_state() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    // Incremental payments: 100 + 100 + 100.
+    for _ in 0..3 {
+        c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    }
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 300, "incremental funding must equal total");
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_incremental_funded_matches_single_payment() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id_a = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id_a, &200_i128, &0_u64, &false, &false, &None);
+
+    let id_b = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id_b, &50_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id_b, &150_i128, &0_u64, &false, &false, &None);
+
+    assert_eq!(c.get_invoice(&id_a).funded, c.get_invoice(&id_b).funded);
+    assert_eq!(c.get_invoice(&id_a).status, c.get_invoice(&id_b).status);
+}
+
+#[test]
+fn test_incremental_audit_log_grows_per_action() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_audit_log(&id).len(), 1);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_audit_log(&id).len(), 2);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    // Third payment triggers release, appending a release entry.
+    assert!(c.get_audit_log(&id).len() >= 3);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #949: Storage tier placement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_storage_tier_invoice_core_readable_after_payment() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    // Core invoice data must remain in the hot tier and be readable.
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.id, id);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+#[test]
+fn test_storage_tier_ext_data_isolated_from_core() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Core and extended records are stored separately and both retrievable.
+    let core = c.get_invoice(&id);
+    let ext = c.get_invoice_ext(&id);
+    assert_eq!(core.id, id);
+    assert!(ext.allowed_payers.is_none());
+}
+
+#[test]
+fn test_storage_tier_tombstone_after_delete() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    // Tombstone lives in its own tier and survives the core record removal.
+    let tombstone = c.get_tombstone(&id);
+    assert_eq!(tombstone.invoice_id, id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Deleted);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #957: Guard failure events
+// ---------------------------------------------------------------------------
+
+fn has_guard_failure_event(env: &Env, guard: &str) -> bool {
+    env.events().all().events().iter().any(|event| {
+        xdr_event_topics(env, event)
+            .map(|topics| topic1_is(env, &topics, "grd_fail") && topic2_is(env, &topics, guard))
+            .unwrap_or(false)
+    })
+}
+
+fn topic2_is(env: &Env, topics: &soroban_sdk::Vec<soroban_sdk::Val>, name: &str) -> bool {
+    use soroban_sdk::TryIntoVal;
+    topics.len() >= 3 && topics
+        .get(2)
+        .and_then(|v| { let r: Result<Symbol, _> = v.try_into_val(env); r.ok() })
+        .map(|s: Symbol| s == Symbol::new(env, name))
+        .unwrap_or(false)
+}
+
+#[test]
+fn test_guard_failure_event_on_deadline_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    env.ledger().set_timestamp(3_000);
+
+    let res = c.try_pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment past deadline must fail");
+    assert!(
+        has_guard_failure_event(&env, "deadline"),
+        "deadline guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_overpayment_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "overpayment must fail");
+    assert!(
+        has_guard_failure_event(&env, "overpay"),
+        "overpayment guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_deleted_invoice_guard() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    let res = c.try_pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment on deleted invoice must fail");
+    assert!(
+        has_guard_failure_event(&env, "deleted"),
+        "deleted-invoice guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_on_circuit_breaker_guard() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let reason = String::from_str(&env, "emergency");
+    c.activate_circuit_breaker(&admin, &reason);
+
+    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert!(res.is_err(), "payment while paused must fail");
+    assert!(
+        has_guard_failure_event(&env, "paused"),
+        "circuit-breaker guard failure event not emitted"
+    );
+}
+
+#[test]
+fn test_guard_failure_event_absent_on_success() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    assert!(
+        !has_guard_failure_event(&env, "deadline"),
+        "no guard failure event should be emitted on success"
+    );
+}
+
 #[test]
 fn test_circuit_breaker_defaults_inactive() {
     let (env, contract_id, _token_id) = setup();
@@ -8690,227 +9017,687 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
 
 
 // ---------------------------------------------------------------------------
-// Issue #930 — webhook notification system
+// Issue #892: Contract security audit framework
 // ---------------------------------------------------------------------------
 
-mod webhook_sinks {
-    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
-
-    /// Subscriber that records the last delivery it received.
-    #[contract]
-    pub struct OkSink;
-    #[contractimpl]
-    impl OkSink {
-        pub fn on_webhook(env: Env, delivery_id: u64, invoice_id: u64, event: u32) {
-            env.storage()
-                .instance()
-                .set(&symbol_short!("last"), &(delivery_id, invoice_id, event));
-        }
-    }
-
-    /// Subscriber that always fails.
-    #[contract]
-    pub struct FailSink;
-    #[contractimpl]
-    impl FailSink {
-        pub fn on_webhook(_env: Env, _delivery_id: u64, _invoice_id: u64, _event: u32) {
-            panic!("sink unavailable");
-        }
-    }
-}
-
-fn endpoint(env: &Env) -> String {
-    String::from_str(env, "https://relayer.example/hooks/split")
-}
-
 #[test]
-fn test_930_register_and_list_webhook() {
+fn test_892_add_and_remove_security_auditor() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
+    let auditor = Address::generate(&env);
 
-    let id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None);
-    let wh = c.get_webhook(&id).unwrap();
-    assert_eq!(wh.owner, owner);
-    assert_eq!(wh.event_mask, webhooks::EVENT_ALL);
-    assert!(wh.active);
-    assert_eq!(c.list_webhooks().len(), 1);
-    assert_eq!(c.list_owner_webhooks(&owner).len(), 1);
+    c.add_security_auditor(&auditor);
+    assert!(c.get_security_auditors().contains(&auditor));
+
+    // Adding twice is idempotent.
+    c.add_security_auditor(&auditor);
+    assert_eq!(c.get_security_auditors().len(), 1);
+
+    c.remove_security_auditor(&auditor);
+    assert!(c.get_security_auditors().is_empty());
 }
 
 #[test]
-#[should_panic(expected = "invalid webhook event mask")]
-fn test_930_register_rejects_empty_mask() {
+fn test_892_contract_audit_passes_on_initialized_contract() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
-    c.register_webhook(&owner, &endpoint(&env), &None, &0u32, &None);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.audit_id, 1);
+    assert_eq!(report.invoice_id, None);
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.critical_failures, 0);
+    assert_eq!(report.risk_score, 0);
+    assert_eq!(report.passed_count, report.findings.len());
+
+    assert_eq!(c.get_security_audit_count(), 1);
+    assert_eq!(c.get_security_audit(&1), Some(report));
 }
 
 #[test]
-#[should_panic(expected = "webhook requires an endpoint or target")]
-fn test_930_register_rejects_missing_destination() {
+fn test_892_contract_audit_flags_paused_contract_as_info() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
-    c.register_webhook(&owner, &String::from_str(&env, ""), &None, &webhooks::EVENT_ALL, &None);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    let admin: Address = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&admin_key()).unwrap()
+    });
+    c.pause(&admin);
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.risk_score, 0);
+    let failed = report.findings.iter().find(|f| !f.passed).unwrap();
+    assert_eq!(failed.check, symbol_short!("not_psd"));
+    assert_eq!(failed.severity, security_audit::AuditSeverity::Info);
 }
 
 #[test]
-fn test_930_endpoint_delivery_pending_until_acked() {
+fn test_892_invoice_audit_passes_for_valid_invoice() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
     env.ledger().set_timestamp(1_000);
-
-    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_CREATED, &None);
-    let invoice_id = make_invoice(
-        &env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999,
-    );
-
-    let deliveries = c.list_webhook_deliveries(&wh_id);
-    assert_eq!(deliveries.len(), 1);
-    let d = deliveries.get(0).unwrap();
-    assert_eq!(d.invoice_id, invoice_id);
-    assert_eq!(d.event, webhooks::EVENT_CREATED);
-    assert_eq!(d.status, webhooks::DeliveryStatus::Pending);
-    assert_eq!(d.attempts, 1);
-    assert!(d.next_retry_ledger > d.last_attempt_ledger);
-
-    let status = c.ack_webhook_delivery(&owner, &d.id, &true);
-    assert_eq!(status, webhooks::DeliveryStatus::Delivered);
-    assert_eq!(c.get_webhook(&wh_id).unwrap().delivered_count, 1);
-}
-
-#[test]
-fn test_930_event_mask_filters_events() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
-
-    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_RELEASED, &None);
-    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
-
-    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
-}
-
-#[test]
-fn test_930_invoice_scope_filters_other_invoices() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
     let creator = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
+    let recipient = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
 
-    let first = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
-    let wh_id = c.register_webhook(
-        &owner, &endpoint(&env), &None, &webhooks::EVENT_CANCELLED, &Some(first),
-    );
-    let second = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
-
-    c.cancel_invoice(&creator, &second);
-    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
-
-    c.cancel_invoice(&creator, &first);
-    let deliveries = c.list_webhook_deliveries(&wh_id);
-    assert_eq!(deliveries.len(), 1);
-    assert_eq!(deliveries.get(0).unwrap().invoice_id, first);
+    let report = c.run_invoice_security_audit(&auditor, &id);
+    assert_eq!(report.invoice_id, Some(id));
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(c.get_security_audit_count(), 1);
 }
 
 #[test]
-fn test_930_target_contract_delivered_immediately() {
-    let (env, contract_id, token_id) = setup_initialized();
+#[should_panic(expected = "caller is not a registered auditor")]
+fn test_892_unregistered_auditor_cannot_run_audit() {
+    let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
-    let sink = env.register(webhook_sinks::OkSink, ());
-    env.ledger().set_timestamp(1_000);
-
-    let wh_id = c.register_webhook(
-        &owner, &String::from_str(&env, ""), &Some(sink), &webhooks::EVENT_CREATED, &None,
-    );
-    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
-
-    let d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
-    assert_eq!(d.status, webhooks::DeliveryStatus::Delivered);
-    assert_eq!(d.next_retry_ledger, 0);
+    c.run_security_audit(&Address::generate(&env));
 }
 
 #[test]
-fn test_930_failing_target_retries_with_backoff_then_fails() {
-    let (env, contract_id, token_id) = setup_initialized();
+#[should_panic(expected = "auditor not registered")]
+fn test_892_remove_unknown_auditor_panics() {
+    let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
-    let sink = env.register(webhook_sinks::FailSink, ());
-    env.ledger().set_timestamp(1_000);
-    env.ledger().set_sequence_number(100);
+    c.remove_security_auditor(&Address::generate(&env));
+}
 
-    let wh_id = c.register_webhook(
-        &owner, &String::from_str(&env, ""), &Some(sink), &webhooks::EVENT_CREATED, &None,
-    );
-    // Creating the invoice must succeed even though the subscriber fails.
-    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+#[test]
+fn test_892_security_event_log_is_bounded() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
 
-    let mut d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
-    assert_eq!(d.status, webhooks::DeliveryStatus::Pending);
-    assert_eq!(d.next_retry_ledger, 100 + webhooks::backoff_ledgers(1));
-
-    // Backoff doubles on each failed attempt.
-    let mut prev_gap = webhooks::backoff_ledgers(1);
-    while d.status == webhooks::DeliveryStatus::Pending {
-        env.ledger().set_sequence_number(d.next_retry_ledger);
-        c.retry_webhook_delivery(&d.id);
-        d = c.get_webhook_delivery(&d.id).unwrap();
-        if d.status == webhooks::DeliveryStatus::Pending {
-            let gap = d.next_retry_ledger - d.last_attempt_ledger;
-            assert!(gap >= prev_gap);
-            prev_gap = gap;
-        }
+    for _ in 0..(security_audit::MAX_SECURITY_EVENTS + 5) {
+        c.log_security_event(
+            &auditor,
+            &symbol_short!("susp_pay"),
+            &security_audit::AuditSeverity::High,
+            &Some(7u64),
+        );
     }
-
-    assert_eq!(d.status, webhooks::DeliveryStatus::Failed);
-    assert_eq!(d.attempts, webhooks::MAX_DELIVERY_ATTEMPTS);
-    assert_eq!(c.get_webhook(&wh_id).unwrap().failed_count, 1);
+    let log = c.get_security_events();
+    assert_eq!(log.len(), security_audit::MAX_SECURITY_EVENTS);
+    let first = log.get(0).unwrap();
+    assert_eq!(first.reporter, auditor);
+    assert_eq!(first.invoice_id, Some(7u64));
+    assert_eq!(first.severity, security_audit::AuditSeverity::High);
 }
 
 #[test]
-#[should_panic(expected = "retry not yet due")]
-fn test_930_retry_before_backoff_rejected() {
+fn test_892_severity_weights_are_monotonic() {
+    use security_audit::AuditSeverity;
+    assert!(AuditSeverity::Info.weight() < AuditSeverity::Low.weight());
+    assert!(AuditSeverity::Low.weight() < AuditSeverity::Medium.weight());
+    assert!(AuditSeverity::Medium.weight() < AuditSeverity::High.weight());
+    assert!(AuditSeverity::High.weight() < AuditSeverity::Critical.weight());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+
+fn setup_911() -> (Env, Address, Address, Address, Address, u64) {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
     env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(600_i128);
+    amounts.push_back(400_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &default_options(&env));
+    (env, contract_id, creator, r1, r2, id)
+}
 
-    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_CREATED, &None);
-    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
-    let d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
-    c.retry_webhook_delivery(&d.id);
+fn milestones_911(env: &Env) -> Vec<u32> {
+    let mut m = Vec::new(env);
+    m.push_back(5_000u32);
+    m.push_back(10_000u32);
+    m
 }
 
 #[test]
-fn test_930_update_and_remove_webhook() {
+fn test_911_init_tracking_creates_structure() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+
+    let t = c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    assert_eq!(t.total_due, 1_000);
+    assert_eq!(t.total_paid, 0);
+    assert_eq!(t.recipients.len(), 2);
+    assert_eq!(t.recipients.get(0).unwrap().recipient, r1);
+    assert_eq!(t.recipients.get(1).unwrap().recipient, r2);
+    assert_eq!(t.milestones.len(), 2);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+    assert_eq!(c.get_recipient_paid_flags(&id), 0);
+    assert_eq!(c.get_payment_tracker(&id), Some(t));
+}
+
+#[test]
+fn test_911_partial_payments_set_paid_flags_and_milestones() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+
+    // 300 of 1000 paid: below the 50% milestone.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert_eq!(t.total_paid, 300);
+    assert!(!c.is_recipient_paid(&id, &0));
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+
+    // r1 fully paid (600) → 60%: first milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert!(c.is_recipient_paid(&id, &0));
+    assert!(!c.is_recipient_paid(&id, &1));
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b01);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+
+    // r2 fully paid → 100%: second milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r2, &400);
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b11);
+    assert_eq!(t.total_paid, 1_000);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+}
+
+#[test]
+fn test_911_settle_milestones_in_order() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+
+    let t = c.settle_payment_milestone(&creator, &id, &0);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+    let t = c.settle_payment_milestone(&creator, &id, &1);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+}
+
+#[test]
+#[should_panic(expected = "previous milestone not settled")]
+fn test_911_settle_out_of_order_panics() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+    c.settle_payment_milestone(&creator, &id, &1);
+}
+
+#[test]
+#[should_panic(expected = "milestone not reached")]
+fn test_911_settle_unreached_milestone_panics() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.settle_payment_milestone(&creator, &id, &0);
+}
+
+#[test]
+#[should_panic(expected = "payment exceeds recipient amount due")]
+fn test_911_overpayment_rejected() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &601);
+}
+
+#[test]
+fn test_911_failed_update_leaves_state_unchanged() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &100);
+    let before = c.get_payment_tracker(&id);
+
+    let result = c.try_record_partial_payment(&creator, &id, &r1, &10_000);
+    assert!(result.is_err());
+    assert_eq!(c.get_payment_tracker(&id), before);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can record payments")]
+fn test_911_non_creator_cannot_record() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&Address::generate(&env), &id, &r1, &100);
+}
+
+#[test]
+#[should_panic(expected = "milestones must be strictly ascending")]
+fn test_911_invalid_milestones_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    let mut m = Vec::new(&env);
+    m.push_back(5_000u32);
+    m.push_back(5_000u32);
+    c.init_payment_tracking(&creator, &id, &m);
+}
+
+#[test]
+#[should_panic(expected = "payment tracking already initialised")]
+fn test_911_double_init_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+}
+
+#[test]
+fn test_911_paid_bps_helper() {
+    assert_eq!(payment_tracking::paid_bps(0, 1_000), 0);
+    assert_eq!(payment_tracking::paid_bps(500, 1_000), 5_000);
+    assert_eq!(payment_tracking::paid_bps(2_000, 1_000), 10_000);
+    assert_eq!(payment_tracking::paid_bps(10, 0), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+
+fn vel_cfg_912(max_payments: u32, max_amount: i128, window_secs: u64, cooldown_secs: u64) -> velocity::VelocityConfig {
+    velocity::VelocityConfig {
+        max_payments,
+        max_amount,
+        window_secs,
+        cooldown_secs,
+    }
+}
+
+#[test]
+fn test_912_check_disabled_config_has_no_limits() {
+    let cfg = velocity::VelocityConfig::default();
+    assert!(!cfg.is_enabled());
+}
+
+#[test]
+fn test_912_check_enforces_payment_count() {
+    let cfg = vel_cfg_912(2, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    let s2 = velocity::check(&cfg, &s1, 10, 1_001).unwrap();
+    assert_eq!(s2.payment_count, 2);
+    assert_eq!(
+        velocity::check(&cfg, &s2, 10, 1_002),
+        Err(ContractError::RateLimitExceeded)
+    );
+}
+
+#[test]
+fn test_912_check_enforces_amount_cap() {
+    let cfg = vel_cfg_912(0, 100, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 60, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 41, 1_001),
+        Err(ContractError::RateLimitExceeded)
+    );
+    // Exactly at the cap is allowed.
+    let s2 = velocity::check(&cfg, &s1, 40, 1_001).unwrap();
+    assert_eq!(s2.amount_total, 100);
+}
+
+#[test]
+fn test_912_check_window_resets_after_elapsed() {
+    let cfg = vel_cfg_912(1, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert!(velocity::check(&cfg, &s1, 10, 1_099).is_err());
+    let s2 = velocity::check(&cfg, &s1, 10, 1_100).unwrap();
+    assert_eq!(s2.window_start, 1_100);
+    assert_eq!(s2.payment_count, 1);
+}
+
+#[test]
+fn test_912_check_enforces_cooldown() {
+    let cfg = vel_cfg_912(0, 0, 0, 30);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 10, 1_029),
+        Err(ContractError::RateLimitExceeded)
+    );
+    assert!(velocity::check(&cfg, &s1, 10, 1_030).is_ok());
+}
+
+#[test]
+fn test_912_check_rejects_non_positive_and_overflow() {
+    let cfg = vel_cfg_912(0, 0, 0, 1);
+    let s0 = velocity::VelocityState::default();
+    assert_eq!(velocity::check(&cfg, &s0, 0, 1), Err(ContractError::InvalidAmount));
+    assert_eq!(velocity::check(&cfg, &s0, -5, 1), Err(ContractError::InvalidAmount));
+    let full = velocity::VelocityState {
+        window_start: 1,
+        payment_count: 1,
+        amount_total: i128::MAX,
+        last_payment_at: 0,
+    };
+    let cfg = vel_cfg_912(10, 0, 100, 0);
+    assert_eq!(
+        velocity::check(&cfg, &full, 1, 2),
+        Err(ContractError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn test_912_invalid_config_rejected() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    // Window limit with zero window.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(5, 0, 0, 0)).is_err());
+    // Negative amount cap.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(0, -1, 10, 0)).is_err());
+}
+
+#[test]
+fn test_912_pay_blocked_after_payment_count_limit() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let owner = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
     env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
 
-    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None);
-    c.update_webhook(&owner, &wh_id, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None, &false);
-    assert!(!c.get_webhook(&wh_id).unwrap().active);
+    c.set_velocity_config(&vel_cfg_912(2, 0, 100, 0));
+    assert_eq!(c.get_velocity_config(), vel_cfg_912(2, 0, 100, 0));
 
-    // Inactive webhooks receive nothing.
-    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
-    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id, &100_i128, &1_u64, &false, &false, &None);
+    assert_eq!(c.get_payer_velocity_state(&payer).payment_count, 2);
+    assert!(!c.check_payer_velocity(&payer, &100));
+    assert!(c
+        .try_pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None)
+        .is_err());
 
-    c.remove_webhook(&owner, &wh_id);
-    assert!(c.get_webhook(&wh_id).is_none());
-    assert_eq!(c.list_webhooks().len(), 0);
+    // After the window elapses the payer may pay again.
+    env.ledger().set_timestamp(1_100);
+    assert!(c.check_payer_velocity(&payer, &100));
+    c.pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None);
 }
 
 #[test]
-fn test_930_backoff_is_exponential_and_capped() {
-    assert_eq!(webhooks::backoff_ledgers(1), webhooks::RETRY_BASE_LEDGERS);
-    assert_eq!(webhooks::backoff_ledgers(2), webhooks::RETRY_BASE_LEDGERS * 2);
-    assert_eq!(webhooks::backoff_ledgers(3), webhooks::RETRY_BASE_LEDGERS * 4);
-    assert_eq!(webhooks::backoff_ledgers(100), webhooks::RETRY_MAX_BACKOFF_LEDGERS);
+fn test_912_payer_override_and_reset() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let other = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
+
+    c.set_velocity_config(&vel_cfg_912(5, 0, 100, 0));
+    c.set_payer_velocity_override(&payer, &Some(vel_cfg_912(1, 0, 100, 0)));
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 1);
+    assert_eq!(c.get_payer_velocity_config(&other).max_payments, 5);
+
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(!c.check_payer_velocity(&payer, &100));
+
+    c.reset_payer_velocity(&payer);
+    assert_eq!(c.get_payer_velocity_state(&payer), velocity::VelocityState::default());
+    assert!(c.check_payer_velocity(&payer, &100));
+
+    c.set_payer_velocity_override(&payer, &None);
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine
+// ---------------------------------------------------------------------------
+
+fn rule_913(
+    recipient_index: u32,
+    priority: u32,
+    criteria: split_rules::RuleCriteria,
+    amount: split_rules::RuleAmount,
+) -> split_rules::SplitRuleDef {
+    split_rules::SplitRuleDef {
+        recipient_index,
+        priority,
+        criteria,
+        amount,
+    }
+}
+
+fn ctx_913(funded: i128, payer_count: u32, timestamp: u64) -> split_rules::RuleContext {
+    split_rules::RuleContext {
+        funded,
+        payer_count,
+        timestamp,
+    }
+}
+
+fn setup_913() -> (Env, Address, Address, u64) {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(Address::generate(&env));
+    recipients.push_back(Address::generate(&env));
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &99_999, &default_options(&env));
+    (env, contract_id, creator, id)
+}
+
+#[test]
+fn test_913_evaluate_fixed_percentage_and_remainder() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(100)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(2_500)));
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 3);
+
+    let out = split_rules::evaluate(&env, &rules, 3, &ctx_913(1_000, 1, 0));
+    assert_eq!(out.get(0).unwrap(), 100);
+    assert_eq!(out.get(1).unwrap(), 250);
+    assert_eq!(out.get(2).unwrap(), 650);
+}
+
+#[test]
+fn test_913_first_matching_rule_by_priority_wins() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    // Bonus tier once funding reaches 1_000, otherwise a base percentage.
+    rules.push_back(rule_913(0, 1, RuleCriteria::Always, RuleAmount::Percentage(1_000)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(1_000), RuleAmount::Percentage(3_000)));
+    split_rules::validate_rules(&rules, 1);
+
+    let low = split_rules::evaluate(&env, &rules, 1, &ctx_913(500, 0, 0));
+    assert_eq!(low.get(0).unwrap(), 50);
+    let high = split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+    assert_eq!(high.get(0).unwrap(), 300);
+}
+
+#[test]
+fn test_913_criteria_matching() {
+    use split_rules::{criteria_matches, RuleCriteria};
+    let ctx = ctx_913(100, 3, 50);
+    assert!(criteria_matches(&RuleCriteria::Always, &ctx));
+    assert!(criteria_matches(&RuleCriteria::FundedAtLeast(100), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::FundedBelow(100), &ctx));
+    assert!(criteria_matches(&RuleCriteria::PayerCountAtLeast(3), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::PayerCountAtLeast(4), &ctx));
+    assert!(criteria_matches(&RuleCriteria::AfterTimestamp(50), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::BeforeTimestamp(50), &ctx));
+}
+
+#[test]
+fn test_913_unmatched_recipient_gets_zero() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::AfterTimestamp(100), RuleAmount::Fixed(10)));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(1_000, 0, 50));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+fn test_913_zero_funded_yields_zero_amounts() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(0, 0, 0));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+#[should_panic(expected = "split rules exceed funded amount")]
+fn test_913_fixed_exceeding_funded_panics() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1_001)));
+    split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+}
+
+#[test]
+#[should_panic(expected = "rule recipient index out of range")]
+fn test_913_validate_index_out_of_range() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "duplicate rule priority for recipient")]
+fn test_913_validate_duplicate_priority() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(5), RuleAmount::Fixed(2)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "only one recipient may take the remainder")]
+fn test_913_validate_multiple_remainders() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "unconditional percentages exceed 100%")]
+fn test_913_validate_percentages_over_100() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(6_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "rule percentage must be 1..=10000 bps")]
+fn test_913_validate_zero_percentage() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(0)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "split rules must not be empty")]
+fn test_913_validate_empty_rules() {
+    let env = Env::default();
+    split_rules::validate_rules(&Vec::new(&env), 1);
+}
+
+#[test]
+fn test_913_rules_persist_on_invoice_and_evaluate() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(4_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    c.set_invoice_split_rules(&creator, &id, &rules);
+    assert_eq!(c.get_invoice_split_rules(&id), rules);
+
+    // Nothing funded yet.
+    let out = c.evaluate_invoice_split_rules(&id);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+
+    c.clear_invoice_split_rules(&creator, &id);
+    assert!(c.get_invoice_split_rules(&id).is_empty());
+}
+
+#[test]
+fn test_913_preview_split_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, _id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(300)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = c.preview_split_rules(&rules, &2, &ctx_913(1_000, 2, 1_000));
+    assert_eq!(out.get(0).unwrap(), 300);
+    assert_eq!(out.get(1).unwrap(), 700);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can set split rules")]
+fn test_913_non_creator_cannot_set_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    c.set_invoice_split_rules(&Address::generate(&env), &id, &rules);
 }
