@@ -244,6 +244,21 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `scheduled_release_at` | `Option<u64>` | Scheduled release Unix timestamp |
 | `require_kyc` | `bool` | Require payers to pass KYC before paying |
 
+**Input validation (issue #931):**
+
+Core inputs are validated before any storage is written. Each failure aborts with a typed `ContractError`, not a string panic:
+
+| Check | Error |
+|-------|-------|
+| `recipients.len() != amounts.len()` | `InvalidRecipients` (16) |
+| `recipients` is empty | `EmptyRecipientList` (37) |
+| more than `MAX_INVOICE_RECIPIENTS` (200) recipients | `BatchLimitExceeded` (18) |
+| any amount ≤ 0 | `ZeroAmountNotAllowed` (41) |
+| `deadline` ≤ current ledger timestamp | `DeadlinePassed` (3) |
+| `deadline` more than `MAX_DEADLINE_HORIZON_SECS` (~10 years) ahead | `InvalidDeadline` (67) |
+
+The same checks apply to `create_invoices_batch`. The recipients/amounts checks also apply to `create_subscription` and `save_template`.
+
 ### `create_batch`
 
 ```rust

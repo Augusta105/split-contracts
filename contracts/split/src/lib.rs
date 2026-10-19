@@ -5403,12 +5403,11 @@ impl SplitContract {
     ) -> u64 {
         check_not_paused(env);
         validate_allowed_token(env, &funding_token);
-        assert!(
-            recipients.len() == amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-
-        assert!(!recipients.is_empty(), "must have at least one recipient");
+        // Issue #931: validate recipients, amounts and deadline with typed errors
+        // before any storage is written.
+        if let Err(e) = validation::validate_invoice_inputs(env, &recipients, &amounts, deadline) {
+            env.panic_with_error(e);
+        }
         // Issue #526: enforce minimum recipient count.
         {
             let min_recipients: u32 = env
@@ -5420,14 +5419,6 @@ impl SplitContract {
                 panic_with_error!(env, ContractError::TooFewRecipients);
             }
         }
-        // Issue #483: reject zero or negative amounts at entry point.
-        for amt in amounts.iter() {
-            guard_nonzero_amount(amt).expect("ZeroAmountNotAllowed");
-        }
-        assert!(
-            deadline > env.ledger().timestamp(),
-            "deadline must be in the future"
-        );
         // Issue #430 / #697: creator-defined payment window.
         if let Some(close_at) = payment_close_at {
             assert!(
@@ -5496,10 +5487,6 @@ impl SplitContract {
                 price_oracle.is_none(),
                 "cannot set both price_oracle and oracle"
             );
-        }
-
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
         }
 
         let _total_amount: i128 = amounts.iter().sum();
@@ -6146,20 +6133,14 @@ impl SplitContract {
         // Pre-validate all invoices before creating any —
         // ensures atomicity: all succeed or none are created.
         for params in params_list.iter() {
-            assert!(
-                params.recipients.len() == params.amounts.len(),
-                "recipients and amounts length mismatch"
-            );
-            assert!(
-                !params.recipients.is_empty(),
-                "must have at least one recipient"
-            );
-            assert!(
-                params.deadline > env.ledger().timestamp(),
-                "deadline must be in the future"
-            );
-            for amt in params.amounts.iter() {
-                assert!(amt > 0, "amounts must be positive");
+            // Issue #931: shared invoice input validation.
+            if let Err(e) = validation::validate_invoice_inputs(
+                &env,
+                &params.recipients,
+                &params.amounts,
+                params.deadline,
+            ) {
+                env.panic_with_error(e);
             }
         }
 
@@ -6249,18 +6230,14 @@ impl SplitContract {
     ) -> u64 {
         creator.require_auth();
 
-        assert!(
-            recipients.len() == amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-        assert!(!recipients.is_empty(), "must have at least one recipient");
+        // Issue #931: shared recipients/amounts validation.
+        if let Err(e) = validation::validate_recipients_and_amounts(&recipients, &amounts) {
+            env.panic_with_error(e);
+        }
         assert!(
             months > 0 && months <= 12,
             "months must be between 1 and 12"
         );
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
-        }
 
         let deadline = env.ledger().timestamp() + 30 * 24 * 60 * 60;
         let id = Self::_create_invoice_inner(
@@ -12283,13 +12260,9 @@ impl SplitContract {
         token: Address,
     ) -> u32 {
         creator.require_auth();
-        assert!(
-            recipients.len() == amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-        assert!(!recipients.is_empty(), "must have at least one recipient");
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
+        // Issue #931: shared recipients/amounts validation.
+        if let Err(e) = validation::validate_recipients_and_amounts(&recipients, &amounts) {
+            env.panic_with_error(e);
         }
 
         let count: u32 = env

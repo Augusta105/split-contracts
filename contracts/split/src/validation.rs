@@ -7,6 +7,79 @@
 use crate::error::ContractError;
 use soroban_sdk::{symbol_short, Address, Env, IntoVal, Map, Val, Vec};
 
+/// Issue #931: Maximum number of recipients on a single invoice. Bounds the
+/// release loop and per-invoice storage (see `DEFAULT_INVOICE_STORAGE_QUOTA`).
+pub const MAX_INVOICE_RECIPIENTS: u32 = 200;
+
+/// Issue #931: Maximum distance between the current ledger time and an
+/// invoice deadline (~10 years). Rejects typos such as millisecond timestamps
+/// that would lock funds effectively forever.
+pub const MAX_DEADLINE_HORIZON_SECS: u64 = 315_360_000;
+
+/// Issue #931: Validate the recipients and amounts arrays of an invoice.
+///
+/// Checks, in order:
+/// 1. `recipients.len() == amounts.len()` — [ContractError::InvalidRecipients]
+/// 2. at least one recipient — [ContractError::EmptyRecipientList]
+/// 3. at most [`MAX_INVOICE_RECIPIENTS`] — [ContractError::BatchLimitExceeded]
+/// 4. every amount is strictly positive — [ContractError::ZeroAmountNotAllowed]
+///
+/// Single pass over `amounts`, no allocation.
+///
+/// # Errors
+/// Returns the first failing check's error.
+pub fn validate_recipients_and_amounts(
+    recipients: &Vec<Address>,
+    amounts: &Vec<i128>,
+) -> Result<(), ContractError> {
+    if recipients.len() != amounts.len() {
+        return Err(ContractError::InvalidRecipients);
+    }
+    if recipients.is_empty() {
+        return Err(ContractError::EmptyRecipientList);
+    }
+    if recipients.len() > MAX_INVOICE_RECIPIENTS {
+        return Err(ContractError::BatchLimitExceeded);
+    }
+    for amt in amounts.iter() {
+        if amt <= 0 {
+            return Err(ContractError::ZeroAmountNotAllowed);
+        }
+    }
+    Ok(())
+}
+
+/// Issue #931: Validate an invoice deadline against the current ledger time.
+///
+/// # Errors
+/// - [ContractError::DeadlinePassed] when `deadline <= now`
+/// - [ContractError::InvalidDeadline] when `deadline - now > MAX_DEADLINE_HORIZON_SECS`
+pub fn validate_deadline(env: &Env, deadline: u64) -> Result<(), ContractError> {
+    let now = env.ledger().timestamp();
+    if deadline <= now {
+        return Err(ContractError::DeadlinePassed);
+    }
+    if deadline - now > MAX_DEADLINE_HORIZON_SECS {
+        return Err(ContractError::InvalidDeadline);
+    }
+    Ok(())
+}
+
+/// Issue #931: Validate every core input to invoice creation before any
+/// storage is written: recipients/amounts arrays and the deadline.
+///
+/// # Errors
+/// See [`validate_recipients_and_amounts`] and [`validate_deadline`].
+pub fn validate_invoice_inputs(
+    env: &Env,
+    recipients: &Vec<Address>,
+    amounts: &Vec<i128>,
+    deadline: u64,
+) -> Result<(), ContractError> {
+    validate_recipients_and_amounts(recipients, amounts)?;
+    validate_deadline(env, deadline)
+}
+
 /// Issue #556: Reject a recipient list that contains duplicate addresses.
 ///
 /// Uses a `soroban_sdk::Map` for O(n log n) membership tracking — no
@@ -186,6 +259,126 @@ mod tests {
             v.push_back(Address::generate(&env));
         }
         assert!(assert_unique_recipients(&env, &v).is_ok());
+    }
+
+    // --- validate_invoice_inputs (issue #931) ---
+
+    use soroban_sdk::testutils::Ledger;
+
+    fn addrs(env: &Env, n: u32) -> Vec<Address> {
+        let mut v = Vec::new(env);
+        for _ in 0..n {
+            v.push_back(Address::generate(env));
+        }
+        v
+    }
+
+    fn amts(env: &Env, values: &[i128]) -> Vec<i128> {
+        let mut v = Vec::new(env);
+        for a in values {
+            v.push_back(*a);
+        }
+        v
+    }
+
+    #[test]
+    fn valid_invoice_inputs_pass() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let r = addrs(&env, 2);
+        let a = amts(&env, &[10, 20]);
+        assert_eq!(validate_invoice_inputs(&env, &r, &a, 2_000), Ok(()));
+    }
+
+    #[test]
+    fn length_mismatch_rejected() {
+        let env = Env::default();
+        let r = addrs(&env, 2);
+        let a = amts(&env, &[10]);
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &a),
+            Err(ContractError::InvalidRecipients)
+        );
+    }
+
+    #[test]
+    fn empty_arrays_rejected() {
+        let env = Env::default();
+        let r = addrs(&env, 0);
+        let a = amts(&env, &[]);
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &a),
+            Err(ContractError::EmptyRecipientList)
+        );
+    }
+
+    #[test]
+    fn too_many_recipients_rejected() {
+        let env = Env::default();
+        let n = MAX_INVOICE_RECIPIENTS + 1;
+        let r = addrs(&env, n);
+        let mut a = Vec::new(&env);
+        for _ in 0..n {
+            a.push_back(1i128);
+        }
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &a),
+            Err(ContractError::BatchLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn max_recipients_accepted() {
+        let env = Env::default();
+        let r = addrs(&env, MAX_INVOICE_RECIPIENTS);
+        let mut a = Vec::new(&env);
+        for _ in 0..MAX_INVOICE_RECIPIENTS {
+            a.push_back(1i128);
+        }
+        assert_eq!(validate_recipients_and_amounts(&r, &a), Ok(()));
+    }
+
+    #[test]
+    fn zero_and_negative_amounts_rejected() {
+        let env = Env::default();
+        let r = addrs(&env, 2);
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[10, 0])),
+            Err(ContractError::ZeroAmountNotAllowed)
+        );
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[-1, 10])),
+            Err(ContractError::ZeroAmountNotAllowed)
+        );
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[i128::MIN, 10])),
+            Err(ContractError::ZeroAmountNotAllowed)
+        );
+    }
+
+    #[test]
+    fn past_and_current_deadline_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        assert_eq!(validate_deadline(&env, 999), Err(ContractError::DeadlinePassed));
+        assert_eq!(validate_deadline(&env, 1_000), Err(ContractError::DeadlinePassed));
+        assert_eq!(validate_deadline(&env, 0), Err(ContractError::DeadlinePassed));
+    }
+
+    #[test]
+    fn deadline_horizon_boundary() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        assert_eq!(validate_deadline(&env, 1_001), Ok(()));
+        assert_eq!(
+            validate_deadline(&env, 1_000 + MAX_DEADLINE_HORIZON_SECS),
+            Ok(())
+        );
+        assert_eq!(
+            validate_deadline(&env, 1_000 + MAX_DEADLINE_HORIZON_SECS + 1),
+            Err(ContractError::InvalidDeadline)
+        );
+        assert_eq!(validate_deadline(&env, u64::MAX), Err(ContractError::InvalidDeadline));
     }
 
     // --- assert_bps_sum (issue #623) ---

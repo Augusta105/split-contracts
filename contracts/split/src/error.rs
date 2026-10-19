@@ -145,4 +145,7 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #931: Invoice deadline is beyond the maximum allowed horizon
+    /// (`validation::MAX_DEADLINE_HORIZON_SECS` from the current ledger time).
+    InvalidDeadline = 67,
 }
