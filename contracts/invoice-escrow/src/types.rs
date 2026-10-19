@@ -2,6 +2,23 @@
 
 use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
+/// Reason a refund was issued, recorded on the invoice and emitted in the
+/// refund event so indexers can categorise refunds.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefundReason {
+    /// Deadline passed without the invoice being fully funded.
+    DeadlineExpired,
+    /// Admin cancelled the invoice before release.
+    AdminCancelled,
+    /// Invoice was over-funded and the excess is being returned.
+    Overfunded,
+    /// Payer requested a refund before the deadline.
+    PayerRequested,
+    /// Refund issued as part of an error recovery path.
+    ErrorRecovery,
+}
+
 /// Lifecycle state of an escrow invoice.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +51,25 @@ pub struct EscrowInvoice {
     pub deadline: u64,
     /// Current lifecycle status.
     pub status: EscrowStatus,
+    /// Reason recorded for the most recent refund, if any.
+    pub refund_reason: Option<RefundReason>,
+}
+
+/// Emitted when funds are refunded to a payer.
+///
+/// Event topics: `(escrow, refunded)`
+/// Event data: `EscrowRefunded { invoice_id, payer, amount, reason }`
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowRefunded {
+    /// The ID of the invoice that was refunded.
+    pub invoice_id: u64,
+    /// The address that received the refund.
+    pub payer: Address,
+    /// The amount of tokens refunded.
+    pub amount: i128,
+    /// The reason the refund was issued.
+    pub reason: RefundReason,
 }
 
 /// Emitted when the admin initiates a two-step admin authority transfer.

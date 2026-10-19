@@ -20,6 +20,8 @@ Full reference for all public entry points in the StellarSplit Soroban contract 
 - [Timelock](#timelock)
 - [Fee Management](#fee-management)
 - [Analytics](#analytics)
+- [Batch Queries](#batch-queries)
+- [Error Recovery](#error-recovery)
 - [Read Functions](#read-functions)
 - [Validation Rules](#validation-rules)
 
@@ -327,6 +329,39 @@ pub fn pay(
 
 Core payment entry point. Transfers `amount` of the invoice token from `payer` to the contract. Auto-releases if fully funded and no guards are active. `nonce` prevents replay. Emits `payment_received`.
 
+**`payment_received` event data:**
+
+```rust
+pub struct PaymentEvent {
+    pub invoice_id: u64,
+    pub payer: Address,
+    pub amount: i128,            // gross amount transferred by the payer
+    pub breakdown: PaymentBreakdown,
+    pub metadata: PaymentMetadata,
+}
+
+pub struct PaymentBreakdown {
+    pub principal: i128,         // amount applied to the invoice total
+    pub platform_fee: i128,      // platform fee deducted at payment time (if any)
+    pub penalty: i128,           // late-payment penalty applied (see `penalty_bps`)
+    pub bonus: i128,             // bonus-pool contribution credited to this payer
+    pub tax: i128,               // tax deduction routed to `tax_authority`
+    pub insurance: i128,         // insurance premium deducted
+    pub net_to_invoice: i128,    // amount credited toward funding after deductions
+}
+
+pub struct PaymentMetadata {
+    pub token: Address,          // token actually transferred
+    pub nonce: u64,              // replay-protection nonce
+    pub via: Option<Address>,    // intermediary (memo pay / channel / bridge relayer)
+    pub memo: Option<u64>,       // memo ID when paid via `pay_with_memo`
+    pub source_chain: Option<String>, // set for `bridge_pay`
+    pub timestamp: u64,          // ledger timestamp of the payment
+}
+```
+
+`breakdown` components always sum to `amount` (`principal + platform_fee + penalty + tax + insurance == amount`; `bonus` and `net_to_invoice` are informational). All fields are fixed-width or `Option`-wrapped so the event remains cheaply indexable by off-chain consumers.
+
 ### `pay_with_attestation`
 
 ```rust
@@ -531,6 +566,23 @@ pub fn refund(env: Env, invoice_id: u64)
 ```
 
 Refunds all payers proportionally. Can be called by anyone after `deadline` passes if the invoice is not fully funded (and `refund_grace_secs` has elapsed if set). Emits `invoice_refunded` and per-payer `payer_refunded`.
+
+**`RefundReason` enum:**
+
+```rust
+pub enum RefundReason {
+    DeadlineExpired,      // deadline passed without full funding
+    CreatorCancelled,     // creator explicitly cancelled the invoice
+    DisputeResolved,      // arbiter resolved the dispute in favour of refund
+    AdminOverride,        // admin force-refunded the invoice
+    PrerequisiteFailed,   // prerequisite invoice was refunded
+    OracleConditionFailed,// oracle confirmed the condition was not met
+    OverflowRefund,       // overpayment returned per `OverflowBehavior::Refund`
+    Manual,               // any other caller-initiated refund
+}
+```
+
+Both `invoice_refunded` and `payer_refunded` events carry a `reason: RefundReason` field so consumers can index refunds by cause. The reason is derived from the call path (e.g. `refund` after deadline → `DeadlineExpired`, `resolve_dispute` with `ResolveAction::Refund` → `DisputeResolved`) and is never caller-supplied.
 
 ### `simulate_release`
 
@@ -941,6 +993,79 @@ pub fn get_creator_volume_used(env: Env, creator: Address) -> i128
 ```
 
 Returns the creator's total lifetime invoice volume (used for fee tier qualification).
+
+---
+
+## Batch Queries
+
+### `batch_query`
+
+```rust
+pub fn batch_query(env: Env, queries: Vec<Query>) -> Vec<QueryResult>
+```
+
+Executes multiple read queries in a single call, reducing RPC round-trips and per-call overhead. Returns exactly one `QueryResult` per input `Query`, **in the same order as the input**.
+
+```rust
+pub enum Query {
+    Invoice(u64),                 // equivalent to `get_invoice`
+    InvoiceSnapshot(u64),         // equivalent to `get_invoice_snapshot`
+    InvoiceExt3(u64),             // equivalent to `get_invoice_ext3`
+    AuditLog(u64),                // equivalent to `get_audit_log`
+    CreatorStats(Address),        // equivalent to `get_creator_stats`
+    CreatorVolumeUsed(Address),   // equivalent to `get_creator_volume_used`
+    ReceiptToken(u64, Address),   // equivalent to `get_receipt_token`
+    IsPaused,                     // equivalent to `is_paused`
+    UsdcToken,                    // equivalent to `get_usdc_token`
+    Treasury,                     // equivalent to `get_treasury`
+}
+
+pub enum QueryResult {
+    Invoice(Invoice),
+    InvoiceSnapshot(InvoiceSnapshot),
+    InvoiceExt3(InvoiceExt3),
+    AuditLog(Vec<AuditEntry>),
+    CreatorStats(CreatorStats),
+    CreatorVolumeUsed(i128),
+    ReceiptToken(Option<Address>),
+    IsPaused(bool),
+    UsdcToken(Address),
+    Treasury(Address),
+    NotFound,                     // invoice ID does not exist
+}
+```
+
+**Ordering:** results are positionally aligned with `queries`; `results[i]` answers `queries[i]`. Callers must not assume any other ordering.
+
+**Deduplication:** identical queries within a single batch (same variant and arguments) are evaluated once and the cached result is reused for every occurrence. Duplicates still produce a result entry at each of their positions, so the output length always equals `queries.len()`.
+
+**Limits:** a batch may contain at most 50 queries; exceeding this panics with `BatchTooLarge`. An empty batch returns an empty vector.
+
+**Errors:** a missing invoice yields `QueryResult::NotFound` rather than panicking, so one bad ID does not fail the whole batch. Malformed input (e.g. exceeding the batch limit) panics.
+
+---
+
+## Error Recovery
+
+### `get_recovery_suggestion`
+
+```rust
+pub fn get_recovery_suggestion(env: Env, error_code: u32) -> RecoverySuggestion
+```
+
+Returns a human-readable recovery suggestion for a contract error code, without mutating state. Intended for wallets and dashboards to surface actionable guidance when a transaction fails.
+
+```rust
+pub struct RecoverySuggestion {
+    pub error_code: u32,
+    pub message: String,          // short description of the error
+    pub suggestion: String,       // recommended next action
+    pub retryable: bool,          // whether retrying the same call may succeed
+    pub related_entrypoint: Option<Symbol>, // entrypoint to call to recover, if any
+}
+```
+
+Unknown error codes return a generic suggestion with `retryable: false` and `related_entrypoint: None`. Recovery never mutates contract state; callers remain responsible for re-submitting transactions.
 
 ---
 

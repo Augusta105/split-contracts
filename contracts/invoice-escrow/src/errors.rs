@@ -2,7 +2,7 @@
 //!
 //! Discriminants are stable — never reorder, only append.
 
-use soroban_sdk::contracterror;
+use soroban_sdk::{contracterror, contracttype, Env, String};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -91,4 +91,123 @@ pub enum Error {
     InvalidGracePeriod = 39,
     /// The refund grace period has already elapsed or been waived.
     RefundGraceElapsed = 40,
+}
+
+/// Returns a human-readable recovery suggestion for the given error.
+///
+/// The suggestion describes how a caller can recover from the failure or
+/// what state the contract is in, so clients can surface actionable guidance.
+pub fn get_recovery_suggestion(error: Error) -> String {
+    match error {
+        Error::NotAdmin => String::from_str(
+            &Env::default(),
+            "Only the contract admin may perform this action; retry from the admin account.",
+        ),
+        Error::NoPendingAdmin => String::from_str(
+            &Env::default(),
+            "No admin transfer is pending; start a transfer with propose_admin first.",
+        ),
+        Error::Unauthorized => String::from_str(
+            &Env::default(),
+            "Caller is not authorized; retry from the pending admin account.",
+        ),
+        Error::AlreadyInitialized => String::from_str(
+            &Env::default(),
+            "Contract is already initialized; no further initialization is required.",
+        ),
+        Error::NotInitialized => String::from_str(
+            &Env::default(),
+            "Contract is not initialized; call initialize before any other operation.",
+        ),
+        Error::InvoiceNotFound => String::from_str(
+            &Env::default(),
+            "Invoice does not exist; verify the invoice ID or create the invoice first.",
+        ),
+        Error::DeadlinePassed => String::from_str(
+            &Env::default(),
+            "Invoice deadline has passed; create a new invoice or request a refund.",
+        ),
+        Error::InvalidStatus => String::from_str(
+            &Env::default(),
+            "Invoice is in the wrong state for this operation; check the current status and retry when valid.",
+        ),
+        Error::InvalidAmount => String::from_str(
+            &Env::default(),
+            "Amount must be greater than zero; retry with a positive amount.",
+        ),
+        Error::InvalidTotalAmount => String::from_str(
+            &Env::default(),
+            "Total amount must be greater than zero; retry with a positive total.",
+        ),
+        Error::OverFunded => String::from_str(
+            &Env::default(),
+            "Deposit would exceed the invoice total; reduce the deposit to the remaining balance.",
+        ),
+        Error::InsufficientFunding => String::from_str(
+            &Env::default(),
+            "Invoice is not fully funded; fund the remaining balance before releasing.",
+        ),
+        Error::DeadlineNotPassed => String::from_str(
+            &Env::default(),
+            "Deadline has not passed yet; wait until the deadline before requesting a refund.",
+        ),
+        Error::InvalidRecipients => String::from_str(
+            &Env::default(),
+            "Recipients and amounts must be non-empty and equal in length; correct the inputs and retry.",
+        ),
+        Error::PayerBlacklisted => String::from_str(
+            &Env::default(),
+            "Payer is blacklisted; submit an appeal or wait for the appeal window to resolve.",
+        ),
+        Error::AppealWindowExpired => String::from_str(
+            &Env::default(),
+            "Appeal window has expired; no further appeals can be submitted.",
+        ),
+        Error::NotBlacklisted => String::from_str(
+            &Env::default(),
+            "Payer is not blacklisted; no appeal or finalisation is needed.",
+        ),
+        Error::AlreadyFinalised => String::from_str(
+            &Env::default(),
+            "Blacklist entry is already finalised; no further action is possible.",
+        ),
+        Error::NotBlacklistedPayer => String::from_str(
+            &Env::default(),
+            "Only the blacklisted payer may perform this action; retry from the payer account.",
+        ),
+    }
+}
+
+/// Maps a raw error code to its `Error` variant, if it is a known code.
+pub fn error_from_code(code: u32) -> Option<Error> {
+    match code {
+        1 => Some(Error::NotAdmin),
+        2 => Some(Error::NoPendingAdmin),
+        3 => Some(Error::Unauthorized),
+        4 => Some(Error::AlreadyInitialized),
+        5 => Some(Error::NotInitialized),
+        6 => Some(Error::InvoiceNotFound),
+        7 => Some(Error::DeadlinePassed),
+        8 => Some(Error::InvalidStatus),
+        9 => Some(Error::InvalidAmount),
+        10 => Some(Error::InvalidTotalAmount),
+        11 => Some(Error::OverFunded),
+        12 => Some(Error::InsufficientFunding),
+        13 => Some(Error::DeadlineNotPassed),
+        14 => Some(Error::InvalidRecipients),
+        15 => Some(Error::PayerBlacklisted),
+        16 => Some(Error::AppealWindowExpired),
+        17 => Some(Error::NotBlacklisted),
+        18 => Some(Error::AlreadyFinalised),
+        19 => Some(Error::NotBlacklistedPayer),
+        _ => None,
+    }
+}
+
+/// Storage key for the recovery-suggestion entrypoint's last queried code.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryKey {
+    /// Last error code queried through the recovery entrypoint.
+    LastErrorCode,
 }

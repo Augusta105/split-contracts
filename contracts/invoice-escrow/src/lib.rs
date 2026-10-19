@@ -429,11 +429,14 @@ fn emit_released(env: &Env, id: u64, total: i128) {
     );
 }
 
-/// Topics: `(escrow, refunded, id)` — Data: (payer, amount)
-fn emit_refunded(env: &Env, id: u64, payer: &Address, amount: i128) {
+/// Topics: `(escrow, refunded, id)` — Data: `(payer, amount, reason)`
+///
+/// The `reason` is included so off-chain indexers can attribute each refund
+/// to a [`RefundReason`] without additional lookups.
+fn emit_refunded(env: &Env, id: u64, payer: &Address, amount: i128, reason: &RefundReason) {
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("refunded"), id),
-        (payer.clone(), amount),
+        (payer.clone(), amount, reason.clone()),
     );
 }
 
@@ -745,6 +748,7 @@ impl InvoiceEscrowContract {
             funded_amount: 0,
             deadline,
             status: EscrowStatus::Pending,
+            refund_reason: None,
         };
         save_invoice(&env, id, &invoice);
 
@@ -779,6 +783,10 @@ impl InvoiceEscrowContract {
     ///
     /// Blacklisted payers (finalised + upheld) are blocked from depositing.
     ///
+    /// All preconditions are validated before any storage write or token
+    /// transfer, so a failed deposit leaves the invoice and payer balances
+    /// untouched.
+    ///
     /// # Errors
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice is not `Pending` or `Active`.
@@ -805,6 +813,7 @@ impl InvoiceEscrowContract {
 
         let mut invoice = get_invoice(&env, invoice_id)?;
 
+        // --- Validate all preconditions before any mutation. ---
         if invoice.status != EscrowStatus::Pending && invoice.status != EscrowStatus::Active {
             return Err(Error::InvalidStatus);
         }
@@ -819,6 +828,7 @@ impl InvoiceEscrowContract {
             return Err(Error::OverFunded);
         }
 
+        // --- Mutations begin here. ---
         // Pull funds from payer into the contract.
         let token_client = token::Client::new(&env, &invoice.token);
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
@@ -856,6 +866,9 @@ impl InvoiceEscrowContract {
     /// if auto-release did not fire (e.g. due to separate partial deposits,
     /// or because a release gate was still closed when funding completed).
     ///
+    /// All preconditions are validated before any storage write or token
+    /// transfer, so a failed release leaves state consistent.
+    ///
     /// # Errors
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice was already released/refunded/cancelled.
@@ -870,6 +883,7 @@ impl InvoiceEscrowContract {
     pub fn release(env: Env, invoice_id: u64) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
+        // --- Validate all preconditions before any mutation. ---
         if invoice.status == EscrowStatus::Released
             || invoice.status == EscrowStatus::Refunded
             || invoice.status == EscrowStatus::Cancelled
@@ -902,9 +916,16 @@ impl InvoiceEscrowContract {
     /// Callable by anyone once the deadline — and any refund grace period
     /// that follows it — has passed and the invoice is not already released.
     ///
+    /// The `reason` is persisted on the invoice and emitted with each refund
+    /// event so off-chain indexers can attribute the refund.
+    ///
+    /// All preconditions are validated before any storage write or token
+    /// transfer, so a failed refund leaves state consistent.
+    ///
     /// # Arguments
     /// * `invoice_id` — Target invoice.
     /// * `payers`     — List of payer addresses to refund in this call.
+    /// * `reason`     — Why the refund is being issued.
     ///
     /// # Errors
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
@@ -915,6 +936,7 @@ impl InvoiceEscrowContract {
     pub fn refund(env: Env, invoice_id: u64, payers: Vec<Address>) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
+        // --- Validate all preconditions before any mutation. ---
         if invoice.status == EscrowStatus::Released
             || invoice.status == EscrowStatus::Refunded
             || invoice.status == EscrowStatus::Cancelled
@@ -929,6 +951,7 @@ impl InvoiceEscrowContract {
             return Err(Error::RefundGraceActive);
         }
 
+        // --- Mutations begin here. ---
         let token_client = token::Client::new(&env, &invoice.token);
         for payer in payers.iter() {
             let amount: i128 = env
@@ -941,11 +964,12 @@ impl InvoiceEscrowContract {
                     .persistent()
                     .remove(&deposit_key(invoice_id, &payer));
                 token_client.transfer(&env.current_contract_address(), &payer, &amount);
-                emit_refunded(&env, invoice_id, &payer, amount);
+                emit_refunded(&env, invoice_id, &payer, amount, &reason);
             }
         }
 
         invoice.status = EscrowStatus::Refunded;
+        invoice.refund_reason = Some(reason);
         save_invoice(&env, invoice_id, &invoice);
         Ok(())
     }
@@ -957,6 +981,9 @@ impl InvoiceEscrowContract {
     /// this call does not transfer tokens, avoiding unbounded iteration over
     /// unknown payers.
     ///
+    /// All preconditions are validated before any storage write, so a failed
+    /// cancellation leaves state consistent.
+    ///
     /// # Errors
     /// * [`Error::NotAdmin`]      — Caller is not the admin.
     /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
@@ -967,12 +994,16 @@ impl InvoiceEscrowContract {
         }
         require_admin(&env);
         let mut invoice = get_invoice(&env, invoice_id)?;
+
+        // --- Validate all preconditions before any mutation. ---
         if invoice.status == EscrowStatus::Released
             || invoice.status == EscrowStatus::Refunded
             || invoice.status == EscrowStatus::Cancelled
         {
             return Err(Error::InvalidStatus);
         }
+
+        // --- Mutations begin here. ---
         invoice.status = EscrowStatus::Cancelled;
         save_invoice(&env, invoice_id, &invoice);
         Ok(())
