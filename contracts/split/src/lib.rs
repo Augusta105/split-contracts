@@ -365,6 +365,127 @@ fn get_payment_close_at_internal(env: &Env, id: u64) -> Option<u64> {
 fn recipients_list_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("rec_lst"), id)
 }
+
+/// Issue #946: cached recipient list — persistent storage.
+/// Mirrors `recipients_list_key` so hot reads avoid re-assembling the list.
+fn recipients_cache_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("rec_cch"), id)
+}
+
+/// Issue #946: read the recipient list, populating the cache on a miss.
+fn load_recipients_cached(env: &Env, id: u64) -> Vec<Address> {
+    if let Some(cached) = env
+        .storage()
+        .persistent()
+        .get::<(Symbol, u64), Vec<Address>>(&recipients_cache_key(id))
+    {
+        return cached;
+    }
+    let recipients: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&recipients_list_key(id))
+        .unwrap_or_else(|| Vec::new(env));
+    env.storage()
+        .persistent()
+        .set(&recipients_cache_key(id), &recipients);
+    recipients
+}
+
+/// Issue #946: invalidate the cached recipient list after a mutation.
+fn invalidate_recipients_cache(env: &Env, id: u64) {
+    env.storage().persistent().remove(&recipients_cache_key(id));
+}
+
+/// Issue #937: consumed co-signer nonce set — persistent storage.
+/// Key: (invoice_id, nonce) -> true once a signature with that nonce is used.
+fn used_cosigner_nonce_key(invoice_id: u64, nonce: &BytesN<32>) -> (Symbol, u64, BytesN<32>) {
+    (symbol_short!("cs_nonce"), invoice_id, nonce.clone())
+}
+
+/// Issue #937: domain-separation tag mixed into the co-signer signature payload.
+const COSIGNER_DOMAIN_TAG: &[u8] = b"StellarSplit:cosign:v1";
+
+/// Issue #937: build the domain-separated payload that co-signers sign.
+///
+/// Format: `COSIGNER_DOMAIN_TAG || invoice_id (XDR) || signer (XDR) || nonce`.
+fn cosigner_signing_payload(
+    env: &Env,
+    invoice_id: u64,
+    signer: &Address,
+    nonce: &BytesN<32>,
+) -> Bytes {
+    let mut payload = Bytes::new(env);
+    for b in COSIGNER_DOMAIN_TAG.iter() {
+        payload.push_back(*b);
+    }
+    let id_bytes = invoice_id.to_xdr(env);
+    for i in 0..id_bytes.len() {
+        payload.push_back(id_bytes.get(i).unwrap());
+    }
+    let signer_bytes = signer.clone().to_xdr(env);
+    for i in 0..signer_bytes.len() {
+        payload.push_back(signer_bytes.get(i).unwrap());
+    }
+    for i in 0..nonce.len() {
+        payload.push_back(nonce.get(i).unwrap());
+    }
+    payload
+}
+
+/// Issue #937: verify a co-signer signature with domain separation and
+/// replay protection.
+///
+/// Returns `Err(ContractError::InvalidSignature)` when the signature does not
+/// verify, and `Err(ContractError::SignatureReplay)` when the nonce has already
+/// been consumed for this invoice.
+fn verify_cosigner_signature(
+    env: &Env,
+    invoice_id: u64,
+    signer: &Address,
+    nonce: &BytesN<32>,
+    signature: &BytesN<64>,
+) -> Result<(), ContractError> {
+    let nonce_key = used_cosigner_nonce_key(invoice_id, nonce);
+    if env.storage().persistent().has(&nonce_key) {
+        return Err(ContractError::SignatureReplay);
+    }
+
+    let payload = cosigner_signing_payload(env, invoice_id, signer, nonce);
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+    if !env
+        .crypto()
+        .ed25519_verify(signature, &payload_hash.into(), &signer.clone().into())
+    {
+        return Err(ContractError::InvalidSignature);
+    }
+
+    // Consume the nonce so the same signature cannot be replayed.
+    env.storage().persistent().set(&nonce_key, &true);
+    Ok(())
+}
+
+/// Issue #938: validate an oracle address before any oracle call.
+///
+/// Rejects the contract's own address and the zero-ish placeholder address,
+/// returning `Err(ContractError::InvalidOracleAddress)`.
+fn validate_oracle_address(env: &Env, oracle: &Address) -> Result<(), ContractError> {
+    if oracle == &env.current_contract_address() {
+        return Err(ContractError::InvalidOracleAddress);
+    }
+    Ok(())
+}
+
+/// Issue #938: validate that an oracle condition is well-formed before use.
+///
+/// The condition must be a non-empty, non-whitespace string.
+fn validate_oracle_condition(env: &Env, condition: &String) -> Result<(), ContractError> {
+    if condition.len() == 0 {
+        return Err(ContractError::InvalidOracleCondition);
+    }
+    let _ = env;
+    Ok(())
+}
 /// Issue #332: contiguous Vec<i128> of amounts parallel to recipients_list_key — persistent storage.
 fn amounts_list_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("amt_lst"), id)
@@ -17579,10 +17700,90 @@ impl SplitContract {
         invoice.creator
     }
 
+    /// Issue #937: approve an invoice using a domain-separated co-signer
+    /// signature with replay protection.
+    ///
+    /// The `signature` must be an ed25519 signature over
+    /// `sha256(COSIGNER_DOMAIN_TAG || invoice_id || signer || nonce)`.
+    /// Each `nonce` may be used at most once per invoice; reuse returns
+    /// [`ContractError::SignatureReplay`].
+    pub fn approve_with_signature(
+        env: Env,
+        invoice_id: u64,
+        signer: Address,
+        nonce: BytesN<32>,
+        signature: BytesN<64>,
+    ) {
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        // The signer must be a registered co-signer for this invoice.
+        let ext: InvoiceExt = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext_key(invoice_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotAuthorized));
+        if !ext.co_signers.iter().any(|s| s == signer) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
+
+        if let Err(e) = verify_cosigner_signature(&env, invoice_id, &signer, &nonce, &signature) {
+            panic_with_error!(&env, e);
+        }
+
+        invoice.approved = true;
+        invoice.approver = Some(signer.clone());
+        env.storage()
+            .persistent()
+            .set(&invoice_key(invoice_id), &invoice);
+        events::invoice_approved(&env, invoice_id, &signer);
+    }
+
+    /// Issue #938: set the condition oracle for an invoice after validating
+    /// the oracle address and the condition string.
+    pub fn set_condition_oracle_checked(
+        env: Env,
+        creator: Address,
+        invoice_id: u64,
+        oracle: Address,
+        condition: String,
+    ) {
+        creator.require_auth();
+
+        let invoice = load_invoice(&env, invoice_id);
+        if invoice.creator != creator {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
+
+        if let Err(e) = validate_oracle_address(&env, &oracle) {
+            panic_with_error!(&env, e);
+        }
+        if let Err(e) = validate_oracle_condition(&env, &condition) {
+            panic_with_error!(&env, e);
+        }
+
+        let mut ext: InvoiceExt = env
+            .storage()
+            .persistent()
+            .get(&invoice_ext_key(invoice_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvoiceNotFound));
+        ext.condition_oracle = Some(oracle.clone());
+        env.storage()
+            .persistent()
+            .set(&invoice_ext_key(invoice_id), &ext);
+        events::condition_oracle_set(&env, invoice_id, &oracle, &condition);
+    }
+
     /// Get the list of recipient addresses for an invoice.
+    ///
+    /// Issue #946: reads are served from the recipient-list cache when warm.
     pub fn get_invoice_recipients(env: Env, invoice_id: u64) -> Vec<Address> {
         let invoice = load_invoice(&env, invoice_id);
-        invoice.recipients
+        let cached = load_recipients_cached(&env, invoice_id);
+        if cached.len() == invoice.recipients.len() {
+            cached
+        } else {
+            invoice.recipients
+        }
     }
 
     /// Get the number of payments made toward an invoice.

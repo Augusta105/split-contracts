@@ -145,4 +145,30 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #937: A co-signer signature failed cryptographic verification against
+    /// the expected signer set (wrong signer, malformed payload, or bad signature bytes).
+    InvalidSignature = 67,
+    /// Issue #937: A required co-signer signature was not supplied for the operation.
+    MissingSignature = 68,
+    /// Issue #937: The supplied signature (or its nonce/ledger window) has already
+    /// been consumed; replaying it is rejected.
+    SignatureReplayed = 69,
+    /// Issue #937: The signature's validity window has expired (e.g. signed ledger
+    /// bound is in the past) and it can no longer be accepted.
+    SignatureExpired = 70,
+    /// Issue #938: The configured oracle address is malformed or not a valid
+    /// contract address for the expected network.
+    InvalidOracleAddress = 71,
+    /// Issue #938: The oracle's reported condition (e.g. price threshold or
+    /// resolution outcome) was not satisfied, so the operation cannot proceed.
+    OracleConditionNotMet = 72,
+    /// Issue #938: No oracle feed is configured for the requested asset/pair.
+    OracleFeedNotFound = 73,
+    /// Issue #951: A supplied argument failed a generic range/format validation
+    /// check that has no more specific variant.
+    InvalidArgument = 74,
+    /// Issue #951: A required storage entry was absent when the operation needed it.
+    MissingStorageEntry = 75,
+    /// Issue #951: The requested operation is not supported by this contract version.
+    UnsupportedOperation = 76,
 }

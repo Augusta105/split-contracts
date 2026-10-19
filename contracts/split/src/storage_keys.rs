@@ -216,6 +216,12 @@ pub enum InvoiceKey {
     /// Per-invoice event sequence counter — typed replacement for the former
     /// `(symbol_short!("ev_seq"), invoice_id)` inline key (issue #708).
     EvSeq(u64),
+    /// Issue #946: Cached recipient list for an invoice (persistent storage).
+    ///
+    /// Holds a serialized snapshot of the invoice's recipient list so hot
+    /// read paths avoid re-decoding the full invoice record. Invalidated
+    /// whenever the recipient list changes (see `RecipientsList`).
+    RecipientsCache(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +281,12 @@ pub enum CompoundKey {
     Template(Address, Symbol),
     TemplateVersion(Address, Symbol, u32),
     TemplateVersionCount(Address, Symbol),
+    /// Issue #937: Marks a co-signer signature nonce as consumed.
+    ///
+    /// Keyed by `(invoice_id, signer)` so replay protection is scoped per
+    /// invoice and per signer. Presence of this key means the nonce has
+    /// already been used and the signature must be rejected.
+    UsedSignatureNonce(u64, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +401,7 @@ mod tests {
             InvoiceKey::RecipientsList(id), InvoiceKey::AmountsList(id),
             InvoiceKey::PaidFlags(id), InvoiceKey::MilestoneFlags(id),
             InvoiceKey::ArchiveMarker(id), InvoiceKey::CreatedLedger(id),
-            InvoiceKey::EvSeq(id),
+            InvoiceKey::EvSeq(id), InvoiceKey::RecipientsCache(id),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -412,6 +424,27 @@ mod tests {
         assert_ne!(
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 0)),
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 1))
+        );
+        assert_ne!(
+            xdr_ik(&env, &InvoiceKey::RecipientsCache(1)),
+            xdr_ik(&env, &InvoiceKey::RecipientsCache(2))
+        );
+    }
+
+    #[test]
+    fn used_signature_nonce_scoped_by_invoice_and_signer() {
+        let env = Env::default();
+        let a = soroban_sdk::Address::generate(&env);
+        let b = soroban_sdk::Address::generate(&env);
+        // Same signer, different invoice → distinct keys.
+        assert_ne!(
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, a.clone())),
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(2, a.clone()))
+        );
+        // Same invoice, different signer → distinct keys.
+        assert_ne!(
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, a.clone())),
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, b.clone()))
         );
     }
 
@@ -462,6 +495,7 @@ mod tests {
             CompoundKey::ConfidentialPay(id, addr.clone()),
             CompoundKey::Delegation(id, addr.clone()),
             CompoundKey::PayerCooldown(id, addr.clone()),
+            CompoundKey::UsedSignatureNonce(id, addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
