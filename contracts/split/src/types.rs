@@ -1653,12 +1653,212 @@ pub struct ComputeEstimate {
     pub fee_stroops: i128,
 }
 
+/// Issue #925: Lifecycle of a payment batch.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaymentBatchStatus {
+    Open,
+    Executed,
+    Cancelled,
+}
+
+/// Issue #925: Payments collected for one payer, settled with a single token transfer.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentBatch {
+    pub id: u64,
+    pub payer: Address,
+    pub token: Address,
+    /// One entry per invoice; repeated additions to the same invoice are merged.
+    pub items: Vec<InvoicePayment>,
+    pub total: i128,
+    pub status: PaymentBatchStatus,
+    pub created_at: u64,
+    pub executed_at: u64,
+}
+
+/// Issue #925: Outcome and cost comparison of one executed batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchExecutionReport {
+    pub batch_id: u64,
+    pub item_count: u32,
+    pub total_amount: i128,
+    /// Token transfers performed (always 1) vs. one per item when paid individually.
+    pub token_transfers: u32,
+    pub transfers_saved: u32,
+    pub batched_cpu_insns: u64,
+    pub unbatched_cpu_insns: u64,
+    /// Estimated instruction savings vs. individual `pay` calls, in basis points.
+    pub savings_bps: u32,
+}
+
+/// Issue #925: Cumulative batching metrics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchingStats {
+    pub batches_executed: u64,
+    pub items_processed: u64,
+    pub total_volume: i128,
+    pub transfers_saved: u64,
+    pub estimated_insns_saved: u64,
+    pub last_savings_bps: u32,
+}
+
+/// Issue #924: Linear cost model for one operation.
+///
+/// `cpu = base_insns + recipients * per_recipient_insns + payers * per_payer_insns
+///        + items * per_item_insns`
+/// `mem = base_mem_bytes + (recipients + payers + items) * per_unit_mem_bytes`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostModel {
+    pub base_insns: u64,
+    pub per_recipient_insns: u64,
+    pub per_payer_insns: u64,
+    pub per_item_insns: u64,
+    pub base_mem_bytes: u64,
+    pub per_unit_mem_bytes: u64,
+}
+
+/// Issue #924: Result of `estimate_operation_cost`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostEstimate {
+    pub operation: Symbol,
+    /// Calibrated instruction estimate (raw estimate scaled by `calibration_bps`).
+    pub cpu_insns: u64,
+    /// Uncalibrated instruction estimate straight from the cost model.
+    pub raw_cpu_insns: u64,
+    pub mem_bytes: u64,
+    pub fee_stroops: i128,
+    /// Observed actual / raw estimate ratio in basis points (10_000 = model is exact).
+    pub calibration_bps: u32,
+    pub within_budget: bool,
+    /// True when served from the estimate cache.
+    pub cached: bool,
+    /// Cost model version the estimate was computed against.
+    pub model_version: u32,
+}
+
+/// Issue #924: Per-operation profiling data built from reported actual usage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationProfile {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub total_raw_estimated_insns: u64,
+    pub total_actual_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub last_actual_insns: u64,
+    /// Error of the calibrated estimate for the last sample, in basis points of actual.
+    pub last_error_bps: u32,
+    /// Samples whose calibrated estimate was within 10% of actual.
+    pub within_tolerance: u32,
+}
+
+/// Issue #924: One row of `get_compute_cost_report`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostReport {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub avg_actual_insns: u64,
+    pub avg_raw_estimated_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub calibration_bps: u32,
+    /// Share of samples estimated within 10%, in basis points.
+    pub accuracy_bps: u32,
+}
+
 /// Issue #297: Circuit breaker status returned by get_circuit_breaker_status().
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct CircuitBreakerStatus {
     pub active: bool,
     pub reason: Option<String>,
+    /// Issue #923: current state machine position.
+    pub state: CircuitBreakerState,
+    /// Issue #923: ledger at which the breaker last opened (0 if never / closed).
+    pub opened_at_ledger: u32,
+    /// Issue #923: ledger at which recovery (HalfOpen) began (0 if not recovering).
+    pub recovery_started_ledger: u32,
+    /// Issue #923: failures reported in the current failure window.
+    pub failure_count: u32,
+}
+
+/// Issue #923: Circuit breaker state machine.
+///
+/// - `Closed`: normal operation.
+/// - `Open`: tripped; all guarded mutating operations fail except exempt ones.
+/// - `HalfOpen`: recovery probation; operations resume, but any reported
+///   failure re-opens the breaker immediately.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Issue #923: Activation and recovery parameters for the circuit breaker.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Failures within `failure_window_ledgers` that trip the breaker. `0` disables auto-trip.
+    pub failure_threshold: u32,
+    /// Length of the failure counting window, in ledgers.
+    pub failure_window_ledgers: u32,
+    /// Minimum ledgers the breaker must spend in `HalfOpen` before recovery can complete.
+    pub recovery_ledgers: u32,
+}
+
+/// Issue #923: A recorded circuit breaker state transition.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerTransition {
+    pub from: CircuitBreakerState,
+    pub to: CircuitBreakerState,
+    pub actor: Address,
+    pub reason: String,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+/// Issue #922: Fee waiver record for a whitelisted creator.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiver {
+    pub creator: Address,
+    pub granted_by: Address,
+    pub granted_at: u64,
+    /// Ledger timestamp at which the waiver lapses; `0` means it never expires.
+    pub expires_at: u64,
+    pub reason: String,
+}
+
+/// Issue #922: Action recorded in the fee waiver audit log.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeWaiverAction {
+    Granted,
+    Extended,
+    Revoked,
+    Expired,
+}
+
+/// Issue #922: A single fee waiver audit log entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiverAuditEntry {
+    pub action: FeeWaiverAction,
+    pub creator: Address,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub ledger: u32,
+    pub expires_at: u64,
 }
 
 /// Issue #295: A single confidential payment record stored per payer.
@@ -1883,115 +2083,233 @@ pub struct PaymentRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #955: Fee event tracking
+// Issue #944: Cursor-based pagination for invoice listings
 // ---------------------------------------------------------------------------
 
-/// Issue #955: Discriminator identifying which fee a fee event refers to.
+/// Issue #944: Deterministic sort order for paginated invoice listings.
 ///
-/// Each variant is emitted as its own event topic so that off-chain indexers
-/// can filter fee activity per fee type without decoding the payload.
+/// Every ordering is a *total* order: ties on the primary key are broken by
+/// the invoice id, so a cursor always resumes at exactly the right position
+/// and no invoice is skipped or returned twice.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub enum FeeType {
-    /// The contract-wide platform fee.
-    Platform,
-    /// The per-invoice creator fee (`creator_fee_bps`).
-    Creator,
-    /// The protocol fee configured via `ProtocolFeeConfig`.
-    Protocol,
-    /// The insurance premium withheld for the insurance fund.
-    Insurance,
+pub enum InvoiceSortOrder {
+    /// Ascending invoice id (creation order).
+    IdAsc,
+    /// Descending invoice id (newest first).
+    IdDesc,
+    /// Ascending deadline; ties broken by ascending id.
+    DeadlineAsc,
+    /// Descending deadline; ties broken by ascending id.
+    DeadlineDesc,
+    /// Ascending funded amount; ties broken by ascending id.
+    FundedAsc,
+    /// Descending funded amount; ties broken by ascending id.
+    FundedDesc,
 }
 
-/// Issue #955: Emitted when a fee amount is calculated for an invoice.
+/// Issue #944: Opaque position marker for cursor-based invoice pagination.
 ///
-/// `amount` is the fee actually withheld in token units; `basis_points` is the
-/// rate that produced it, so indexers can recompute and audit the result.
+/// The cursor records the sort order it was produced under plus the primary
+/// sort key and invoice id of the last item returned. Passing it back to the
+/// list entry point resumes the listing immediately after that item. A cursor
+/// whose `sort` differs from the requested order is rejected by the contract.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct FeeCalculatedEvent {
-    /// Invoice the fee was calculated for.
-    pub invoice_id: u64,
-    /// Which fee this is.
-    pub fee_type: FeeType,
-    /// Fee amount withheld, in token units.
-    pub amount: i128,
-    /// Rate applied, in basis points (10 000 = 100%).
-    pub basis_points: u32,
-    /// Gross amount the fee was computed from.
-    pub base_amount: i128,
-    /// Ledger sequence at which the calculation happened.
+pub struct InvoiceCursor {
+    /// The sort order this cursor was produced under.
+    pub sort: InvoiceSortOrder,
+    /// Invoice id of the last item returned in the previous page.
+    pub last_seen_id: u64,
+    /// Primary sort key of the last item returned (deadline or funded total,
+    /// depending on `sort`; unused for the id-based orders).
+    pub last_seen_key: i128,
+}
+
+/// Issue #944: A single page of invoices plus the cursor for the next page.
+///
+/// `next_cursor` is `None` when the returned page is the last one, so callers
+/// can stop paging without an extra empty request.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaginatedInvoices {
+    /// Invoice ids in this page, already ordered by the requested sort.
+    pub items: Vec<u64>,
+    /// Cursor to pass to the next call, or `None` if this is the last page.
+    pub next_cursor: Option<InvoiceCursor>,
+}
+
+
+/// Issue #926: Audit record written every time an invoice is cloned.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CloneRecord {
+    pub source_id: u64,
+    pub clone_id: u64,
+    pub creator: Address,
+    /// True when produced by `clone_invoice_partial`.
+    pub partial: bool,
+    /// Source recipient indices copied (empty for a full clone).
+    pub recipient_indices: Vec<u32>,
+    /// Fields changed through `CloneOverrides`.
+    pub modified_fields: Vec<Symbol>,
+    pub cloned_at: u64,
     pub ledger: u32,
 }
 
-/// Issue #955: Emitted when a calculated fee is distributed to its recipient.
+/// Issue #927: Lifecycle of an invoice with respect to archival.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArchivalStatus {
+    /// Never archived — lives in persistent storage.
+    Active,
+    /// Moved to cold (instance) storage.
+    Archived,
+    /// Recovered from the archive back into persistent storage.
+    Restored,
+    /// Archived and cleaned up past the retention period (payments dropped).
+    Purged,
+}
+
+/// Issue #927: Per-invoice archival status tracking.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct FeeDistributedEvent {
-    /// Invoice the fee was distributed for.
+pub struct ArchivalRecord {
+    pub status: ArchivalStatus,
+    pub archived_at_ledger: u32,
+    /// `None` for lazy / explicit archival with no authenticated actor.
+    pub archived_by: Option<Address>,
+    pub restored_at_ledger: Option<u32>,
+    pub restored_by: Option<Address>,
+    pub purged_at_ledger: Option<u32>,
+    /// Number of times this invoice has been archived.
+    pub archive_count: u32,
+}
+
+/// Issue #927: Admin-configured archival schedule and cleanup policy.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalPolicy {
+    /// Whether `run_archival_sweep` may run.
+    pub enabled: bool,
+    /// Minimum ledgers between two sweeps.
+    pub sweep_interval_ledgers: u32,
+    /// Invoice IDs scanned per sweep (1–50).
+    pub max_batch: u32,
+    /// Ledgers an archived invoice is retained before it may be purged;
+    /// 0 disables purging.
+    pub retention_ledgers: u32,
+    /// Purge eligible invoices during sweeps.
+    pub auto_purge: bool,
+    /// Ledgers a restored invoice is exempt from re-archival.
+    pub restore_hold_ledgers: u32,
+}
+
+/// Issue #927: Aggregate archival counters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArchivalStats {
+    pub total_archived: u64,
+    pub total_restored: u64,
+    pub total_purged: u64,
+    pub last_sweep_ledger: u32,
+    /// Last invoice ID scanned by the sweep; wraps to 0 at the end.
+    pub sweep_cursor: u64,
+}
+
+/// Issue #928: State machine for recipient address verification.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecipientAuthStatus {
+    Unverified,
+    /// A challenge is outstanding and awaiting the recipient's response.
+    ChallengeIssued,
+    Verified,
+    /// Too many incorrect responses; a new challenge is required.
+    Failed,
+    /// The challenge was not answered before `expires_at`.
+    Expired,
+    /// Verification was withdrawn by the creator.
+    Revoked,
+}
+
+/// Issue #928: Authentication record for one recipient of one invoice.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecipientAuth {
     pub invoice_id: u64,
-    /// Which fee this is.
-    pub fee_type: FeeType,
-    /// Address that received the fee.
     pub recipient: Address,
-    /// Amount transferred, in token units.
-    pub amount: i128,
-    /// Token the fee was paid in.
-    pub token: Address,
-    /// Ledger sequence at which the distribution happened.
-    pub ledger: u32,
+    pub status: RecipientAuthStatus,
+    /// Outstanding challenge; cleared once answered, expired or failed.
+    pub challenge: Option<BytesN<32>>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub verified_at: Option<u64>,
+    /// Incorrect responses to the current challenge.
+    pub attempts: u32,
+    pub nonce: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Issue #953: Detailed state-transition event logging
-// ---------------------------------------------------------------------------
-
-/// Issue #953: Emitted for every invoice state transition.
-///
-/// `from`/`to` are the status bytes (see [`InvoiceStatus::to_u8`]) so the
-/// payload stays compact and forward-compatible with new variants.
+/// Issue #928: Entry in the per-invoice recipient verification audit log.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct StateTransitionEvent {
-    /// Invoice whose state changed.
-    pub invoice_id: u64,
-    /// Status byte before the transition.
-    pub from: u32,
-    /// Status byte after the transition.
-    pub to: u32,
-    /// Address that triggered the transition.
+pub struct RecipientAuthLogEntry {
+    pub recipient: Address,
+    pub action: Symbol,
     pub actor: Address,
-    /// Ledger sequence at which the transition happened.
-    pub ledger: u32,
-    /// Ledger timestamp at which the transition happened.
     pub timestamp: u64,
-    /// Optional human-readable reason tag (e.g. "release", "refund").
-    pub reason: Option<Symbol>,
+    pub ledger: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Issue #942: Lazy-loaded invoice extension cache
-// ---------------------------------------------------------------------------
+/// Issue #929: Kind of reversible operation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpKind {
+    UpdateDeadline,
+    UpdateAmounts,
+    Cancel,
+}
 
-/// Issue #942: Cached copy of an invoice's extension data.
-///
-/// The extension (`InvoiceExt` / `InvoiceExt2`) is only loaded from storage
-/// when a code path actually needs it. Once loaded it is cached under this
-/// record so repeated accesses within the same invocation (and across
-/// invocations, subject to TTL) avoid re-reading and re-decoding the entry.
+/// Issue #929: Rollback state machine — `Recorded` → `Undone`, or
+/// `Recorded` → `Expired` once the window elapses.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReversibleOpStatus {
+    Recorded,
+    Undone,
+    Expired,
+}
+
+/// Issue #929: Invoice fields captured before a reversible operation.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct InvoiceExtCacheEntry {
-    /// Invoice the cached extension belongs to.
-    pub invoice_id: u64,
-    /// Cached extension data.
-    pub ext: InvoiceExt,
-    /// Cached overflow extension data.
-    pub ext2: InvoiceExt2,
-    /// Ledger sequence at which the cache entry was written.
-    pub cached_at_ledger: u32,
+pub struct OperationSnapshot {
+    pub deadline: u64,
+    pub amounts: Vec<i128>,
+    pub base_amounts: Vec<i128>,
+    pub status: InvoiceStatus,
+    pub funded: i128,
+    pub payment_count: u32,
 }
 
+/// Issue #929: A recorded, potentially undoable operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReversibleOp {
+    pub op_id: u64,
+    pub invoice_id: u64,
+    pub kind: ReversibleOpKind,
+    pub actor: Address,
+    /// State to restore on undo.
+    pub before: OperationSnapshot,
+    /// Hash of the state right after the operation; undo requires the
+    /// invoice to still match it.
+    pub after_hash: BytesN<32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: ReversibleOpStatus,
+    pub undone_at: Option<u64>,
+}
 
 #[cfg(test)]
 mod tests {

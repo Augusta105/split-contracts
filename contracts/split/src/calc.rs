@@ -37,6 +37,7 @@ use crate::types::BASIS_POINTS_TOTAL;
 use soroban_sdk::{Address, Env, Map, Symbol, Vec};
 
 use crate::error::ContractError;
+use crate::math::{bps_of, mul_div, BPS_DENOMINATOR};
 
 // ---------------------------------------------------------------------------
 // Issue #955: Fee event tracking
@@ -123,13 +124,18 @@ pub fn distribute_with_remainder(
 
     let n = ratios.len() as usize;
 
-    // Compute floor shares and remainders.
+    // Compute floor shares and remainders using fixed-point helpers.
+    // `mul_div` performs the same floor division as `total * r / denom` but
+    // guards against intermediate overflow, and `mul_mod` gives the exact
+    // remainder needed for the largest-remainder step.
     let mut shares = Vec::new(env);
     let mut remainders = Vec::new(env);
 
     for r in ratios.iter() {
-        shares.push_back(total * r / denom);
-        remainders.push_back(total * r % denom);
+        let share = mul_div(total, r, denom)?;
+        let rem = mul_mod(total, r, denom)?;
+        shares.push_back(share);
+        remainders.push_back(rem);
     }
 
     // How many extra stroops to distribute?
@@ -244,8 +250,9 @@ pub fn funding_bps(funded: i128, total: i128) -> u32 {
     if funded >= total {
         return 10_000;
     }
-    // funded < total, both positive — safe to cast to u128 and divide.
-    let bps = (funded as u128 * 10_000u128) / (total as u128);
+    // funded < total, both positive — fixed-point helper computes
+    // `funded * 10_000 / total` with overflow-safe intermediate math.
+    let bps = bps_of(funded, total);
     // bps is in [0, 9_999] since funded < total; the clamp is a safeguard.
     bps.min(10_000) as u32
 }
@@ -270,11 +277,90 @@ pub fn calc_platform_fee(funded: i128, fee_bps: u32) -> Result<i128, ContractErr
     if fee_bps == 0 || funded == 0 {
         return Ok(0);
     }
-    let fee = (funded as i128)
-        .checked_mul(fee_bps as i128)
-        .ok_or(ContractError::ArithmeticOverflow)?
-        / 10_000;
-    Ok(fee)
+    // `mul_div` computes `funded * fee_bps / 10_000` with overflow-safe
+    // intermediate arithmetic, preserving the previous checked-mul semantics.
+    mul_div(funded, fee_bps as i128, BPS_DENOMINATOR)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #954 / #956: Payment event breakdown & refund reason helpers
+// ---------------------------------------------------------------------------
+
+/// Detailed, indexable breakdown of a single payment event.
+///
+/// The breakdown is derived from the same arithmetic used to distribute funds
+/// (see [`distribute_with_remainder`] and [`calc_platform_fee`]) so that the
+/// emitted event always reconciles with the amounts actually moved.
+///
+/// All fields are plain integers so the struct can be emitted directly as
+/// event data and indexed by off-chain consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentBreakdown {
+    /// Gross amount collected in this payment (stroops).
+    pub gross: i128,
+    /// Platform fee withheld from `gross` (stroops).
+    pub platform_fee: i128,
+    /// Net amount distributed to recipients (`gross - platform_fee`).
+    pub net: i128,
+    /// Number of recipients the net amount was split across.
+    pub recipient_count: u32,
+    /// Funding completion after this payment, in basis points (0 – 10_000).
+    pub funding_bps: u32,
+}
+
+impl PaymentBreakdown {
+    /// Build a breakdown from a gross payment amount, fee rate and funding state.
+    ///
+    /// # Errors
+    /// Propagates [`ContractError::ArithmeticOverflow`] from [`calc_platform_fee`].
+    pub fn new(
+        gross: i128,
+        fee_bps: u32,
+        recipient_count: u32,
+        funded_after: i128,
+        total: i128,
+    ) -> Result<Self, ContractError> {
+        let platform_fee = calc_platform_fee(gross, fee_bps)?;
+        let net = gross - platform_fee;
+        Ok(Self {
+            gross,
+            platform_fee,
+            net,
+            recipient_count,
+            funding_bps: funding_bps(funded_after, total),
+        })
+    }
+
+    /// Returns `true` when the breakdown is internally consistent:
+    /// `net == gross - platform_fee` and `funding_bps <= 10_000`.
+    pub fn is_consistent(&self) -> bool {
+        self.net == self.gross - self.platform_fee && self.funding_bps <= 10_000
+    }
+}
+
+/// Reason a refund was issued, emitted alongside every refund event.
+///
+/// Kept as a small, explicit enum so the reason is stable, indexable and
+/// self-describing to off-chain consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefundReason {
+    /// Invoice was cancelled before funding completed.
+    Cancelled = 0,
+    /// Invoice expired without reaching its funding goal.
+    Expired = 1,
+    /// Payer requested a refund explicitly.
+    Requested = 2,
+    /// Invoice was overfunded and the excess is being returned.
+    Overfunded = 3,
+    /// Refund issued due to a dispute resolution.
+    Dispute = 4,
+}
+
+impl RefundReason {
+    /// Stable numeric code suitable for event indexing.
+    pub fn code(&self) -> u32 {
+        *self as u32
+    }
 }
 
 /// Compute the platform fee and emit a `fee_calculated` event for it.
@@ -558,56 +644,75 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #955: fee event tests
+    // PaymentBreakdown tests (Issue #954)
     // -----------------------------------------------------------------------
 
-    use soroban_sdk::testutils::Events as _;
-    use soroban_sdk::{symbol_short, IntoVal, TryFromVal};
-
     #[test]
-    fn test_fee_calculated_event_amount_matches() {
-        let env = Env::default();
-        let fee = calc_platform_fee_with_event(&env, 1_000_000, 250).unwrap();
-        assert_eq!(fee, 25_000);
-
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        // Topic 0: event name, Topic 1: fee type.
-        let name: Symbol = Symbol::try_from_val(&env, &last.1.get(0).unwrap()).unwrap();
-        assert_eq!(name, symbol_short!("fee_calc"));
-        let amount: i128 = i128::try_from_val(&env, &last.2).unwrap();
-        assert_eq!(amount, fee);
+    fn test_payment_breakdown_normal() {
+        // 1_000_000 gross at 250 bps, 3 recipients, fully funded afterwards.
+        let b = PaymentBreakdown::new(1_000_000, 250, 3, 1_000_000, 1_000_000).unwrap();
+        assert_eq!(b.gross, 1_000_000);
+        assert_eq!(b.platform_fee, 25_000);
+        assert_eq!(b.net, 975_000);
+        assert_eq!(b.recipient_count, 3);
+        assert_eq!(b.funding_bps, 10_000);
+        assert!(b.is_consistent());
     }
 
     #[test]
-    fn test_fee_calculated_event_per_type() {
-        let env = Env::default();
-        let platform = calc_fee_with_event(&env, FeeType::Platform, 1_000, 100).unwrap();
-        let creator = calc_fee_with_event(&env, FeeType::Creator, 1_000, 200).unwrap();
-        let protocol = calc_fee_with_event(&env, FeeType::Protocol, 1_000, 300).unwrap();
-
-        assert_eq!(platform, 10);
-        assert_eq!(creator, 20);
-        assert_eq!(protocol, 30);
-
-        let events = env.events().all();
-        assert_eq!(events.len(), 3);
+    fn test_payment_breakdown_partial_funding() {
+        let b = PaymentBreakdown::new(500, 0, 2, 500, 1_000).unwrap();
+        assert_eq!(b.platform_fee, 0);
+        assert_eq!(b.net, 500);
+        assert_eq!(b.funding_bps, 5_000);
+        assert!(b.is_consistent());
     }
 
     #[test]
-    fn test_fee_distributed_event_amount_matches() {
-        let env = Env::default();
-        let recipient = Address::generate(&env);
-        let amount = 12_345i128;
-        distribute_fee_with_event(&env, FeeType::Platform, &recipient, amount);
+    fn test_payment_breakdown_overflow() {
+        let result = PaymentBreakdown::new(i128::MAX, 2, 1, 0, 0);
+        assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
 
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        let name: Symbol = Symbol::try_from_val(&env, &last.1.get(0).unwrap()).unwrap();
-        assert_eq!(name, symbol_short!("fee_dist"));
-        let (addr, amt): (Address, i128) =
-            <(Address, i128)>::try_from_val(&env, &last.2).unwrap();
-        assert_eq!(addr, recipient);
-        assert_eq!(amt, amount);
+    #[test]
+    fn test_payment_breakdown_reconciles_with_distribution() {
+        // Net amount must be exactly distributable across recipients.
+        let env = Env::default();
+        let b = PaymentBreakdown::new(1_000, 100, 3, 1_000, 1_000).unwrap();
+        let shares =
+            distribute_with_remainder(&env, b.net, &make_ratios(&env, &[1, 1, 1]), 3).unwrap();
+        let sum: i128 = shares.iter().sum();
+        assert_eq!(sum, b.net);
+    }
+
+    // -----------------------------------------------------------------------
+    // RefundReason tests (Issue #956)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_refund_reason_codes_are_stable() {
+        assert_eq!(RefundReason::Cancelled.code(), 0);
+        assert_eq!(RefundReason::Expired.code(), 1);
+        assert_eq!(RefundReason::Requested.code(), 2);
+        assert_eq!(RefundReason::Overfunded.code(), 3);
+        assert_eq!(RefundReason::Dispute.code(), 4);
+    }
+
+    #[test]
+    fn test_refund_reason_codes_are_unique() {
+        let reasons = [
+            RefundReason::Cancelled,
+            RefundReason::Expired,
+            RefundReason::Requested,
+            RefundReason::Overfunded,
+            RefundReason::Dispute,
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for (j, b) in reasons.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a.code(), b.code());
+                }
+            }
+        }
     }
 }

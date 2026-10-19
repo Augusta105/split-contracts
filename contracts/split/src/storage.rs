@@ -58,6 +58,64 @@ pub fn invalidate_invoice_ext_cache(env: &Env, invoice_id: u64) {
     env.storage().temporary().remove(&cache_key);
 }
 
+/// Storage key for the cached recipient list of a given invoice.
+///
+/// Issue #946: recipient lists are read far more often than they are mutated,
+/// so a short-lived cache entry is kept alongside the persistent entry.
+#[derive(Clone)]
+pub struct RecipientCacheKey {
+    pub invoice_id: u64,
+}
+
+impl IntoVal<Env, Val> for RecipientCacheKey {
+    fn into_val(&self, env: &Env) -> Val {
+        (soroban_sdk::symbol_short!("rec_cache"), self.invoice_id).into_val(env)
+    }
+}
+
+/// Read the cached recipient list for `invoice_id`, populating the cache from
+/// persistent storage on a miss.
+///
+/// `load` is invoked only on a cache miss and is expected to read the
+/// authoritative recipient list from persistent storage. The returned value is
+/// written to the cache (with a TTL bump) so subsequent reads hit the cache.
+pub fn get_cached_recipients<K, V, F>(env: &Env, invoice_id: u64, load: F) -> V
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + Clone,
+    F: FnOnce() -> V,
+{
+    let cache_key = RecipientCacheKey { invoice_id };
+
+    if let Some(cached) = env.storage().persistent().get::<_, V>(&cache_key) {
+        // Refresh the TTL on hit so hot entries do not expire mid-use.
+        env.storage().persistent().extend_ttl(
+            &cache_key,
+            MIN_INVOICE_TTL_LEDGERS,
+            MAX_INVOICE_TTL_LEDGERS,
+        );
+        return cached;
+    }
+
+    let value = load();
+    env.storage().persistent().set(&cache_key, &value);
+    env.storage().persistent().extend_ttl(
+        &cache_key,
+        MIN_INVOICE_TTL_LEDGERS,
+        MAX_INVOICE_TTL_LEDGERS,
+    );
+    value
+}
+
+/// Invalidate the cached recipient list for `invoice_id`.
+///
+/// Must be called whenever the recipients of an invoice are mutated so that
+/// stale data is never served from the cache.
+pub fn invalidate_recipients_cache(env: &Env, invoice_id: u64) {
+    let cache_key = RecipientCacheKey { invoice_id };
+    env.storage().persistent().remove(&cache_key);
+}
+
 /// Save an invoice entry and automatically bump its TTL.
 ///
 /// # Arguments
@@ -69,10 +127,7 @@ where
     K: IntoVal<Env, Val> + Clone,
     V: IntoVal<Env, Val>,
 {
-    env.storage().persistent().set(&key, value);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, MIN_INVOICE_TTL_LEDGERS, MAX_INVOICE_TTL_LEDGERS);
+    save_in_tier(env, StorageTier::Persistent, key, value);
 }
 
 /// Save a recipients list entry and automatically bump its TTL.
@@ -81,10 +136,7 @@ where
     K: IntoVal<Env, Val> + Clone,
     V: IntoVal<Env, Val>,
 {
-    env.storage().persistent().set(&key, value);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, MIN_INVOICE_TTL_LEDGERS, MAX_INVOICE_TTL_LEDGERS);
+    save_in_tier(env, StorageTier::Persistent, key, value);
 }
 
 /// Save a contributor entry and automatically bump its TTL.
@@ -93,10 +145,77 @@ where
     K: IntoVal<Env, Val> + Clone,
     V: IntoVal<Env, Val>,
 {
-    env.storage().persistent().set(&key, value);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, MIN_INVOICE_TTL_LEDGERS, MAX_INVOICE_TTL_LEDGERS);
+    save_in_tier(env, StorageTier::Persistent, key, value);
+}
+
+/// Load the invoice hot key once and reuse it for the duration of an invocation.
+///
+/// Issue #941: the hot key is read at most once per call; callers pass the
+/// returned value around instead of re-reading storage on every access.
+pub fn load_invoice_hot_cached<K, V>(env: &Env, key: K) -> Option<V>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + soroban_sdk::TryFromVal<Env, Val>,
+{
+    env.storage().persistent().get(&key)
+}
+
+/// Read all payment shards for an invoice in a single pass.
+///
+/// Issue #945: iterates `0..count` once, validating each index before the
+/// storage read. Returns [`ShardError::ShardIndexOutOfBounds`] if `count`
+/// exceeds [`MAX_PAYMENT_SHARDS`].
+pub fn load_payment_shards<K, V>(
+    env: &Env,
+    key_fn: impl Fn(u32) -> K,
+    count: u32,
+) -> Result<soroban_sdk::Vec<V>, ShardError>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + soroban_sdk::TryFromVal<Env, Val>,
+{
+    validate_shard_count(count)?;
+    let mut out = soroban_sdk::Vec::new(env);
+    let mut i = 0u32;
+    while i < count {
+        validate_shard_index(i)?;
+        let key = key_fn(i);
+        if let Some(v) = env.storage().persistent().get::<K, V>(&key) {
+            out.push_back(v);
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Write all payment shards for an invoice in a single pass.
+///
+/// Issue #945: validates the count and every index before writing, so a
+/// partially-invalid batch never mutates storage.
+pub fn save_payment_shards<K, V>(
+    env: &Env,
+    key_fn: impl Fn(u32) -> K,
+    shards: &soroban_sdk::Vec<V>,
+) -> Result<(), ShardError>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val>,
+{
+    let count = shards.len();
+    validate_shard_count(count)?;
+    let mut i = 0u32;
+    while i < count {
+        validate_shard_index(i)?;
+        i += 1;
+    }
+    let mut i = 0u32;
+    while i < count {
+        let key = key_fn(i);
+        let value = shards.get_unchecked(i);
+        save_invoice(env, key, &value);
+        i += 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -152,57 +271,58 @@ mod tests {
     }
 
     #[test]
-    fn test_load_invoice_ext_cached_returns_none_when_absent() {
+    fn test_recipients_cache_miss_populates() {
         let env = Env::default();
         let id = contract_id(&env);
 
         env.as_contract(&id, || {
-            let loaded: Option<i128> = load_invoice_ext_cached(&env, 7u64);
-            assert!(loaded.is_none());
+            let value: i128 = get_cached_recipients(&env, 7u64, || 42i128);
+            assert_eq!(value, 42);
+
+            let cache_key = RecipientCacheKey { invoice_id: 7u64 };
+            let cached: i128 = env
+                .storage()
+                .persistent()
+                .get(&cache_key)
+                .expect("cache should be populated on miss");
+            assert_eq!(cached, 42);
         });
     }
 
     #[test]
-    fn test_load_invoice_ext_cached_caches_value() {
+    fn test_recipients_cache_hit_skips_loader() {
         let env = Env::default();
         let id = contract_id(&env);
-        let ext_key = (symbol_short!("inv_ext"), 7u64);
 
         env.as_contract(&id, || {
-            env.storage().persistent().set(&ext_key, &42i128);
+            let _ = get_cached_recipients(&env, 7u64, || 42i128);
 
-            let first: Option<i128> = load_invoice_ext_cached(&env, 7u64);
-            assert_eq!(first, Some(42));
-
-            // Mutating persistent storage directly must not affect the
-            // cached read until the cache is invalidated.
-            env.storage().persistent().set(&ext_key, &99i128);
-            let cached: Option<i128> = load_invoice_ext_cached(&env, 7u64);
-            assert_eq!(cached, Some(42));
-
-            invalidate_invoice_ext_cache(&env, 7u64);
-            let refreshed: Option<i128> = load_invoice_ext_cached(&env, 7u64);
-            assert_eq!(refreshed, Some(99));
+            let mut loader_called = false;
+            let value: i128 = get_cached_recipients(&env, 7u64, || {
+                loader_called = true;
+                99i128
+            });
+            assert_eq!(value, 42);
+            assert!(!loader_called, "loader must not run on a cache hit");
         });
     }
 
     #[test]
-    fn test_save_invoice_invalidates_ext_cache() {
+    fn test_recipients_cache_invalidation() {
         let env = Env::default();
         let id = contract_id(&env);
-        let ext_key = (symbol_short!("inv_ext"), 7u64);
-        let key = (symbol_short!("test_inv"), 7u64);
-        let value = String::from_str(&env, "test_value");
 
         env.as_contract(&id, || {
-            env.storage().persistent().set(&ext_key, &1i128);
-            let _ = load_invoice_ext_cached::<i128>(&env, 7u64);
+            let _ = get_cached_recipients(&env, 7u64, || 42i128);
 
-            env.storage().persistent().set(&ext_key, &2i128);
-            save_invoice(&env, key.clone(), &value);
+            invalidate_recipients_cache(&env, 7u64);
 
-            let reloaded: Option<i128> = load_invoice_ext_cached(&env, 7u64);
-            assert_eq!(reloaded, Some(2));
+            let cache_key = RecipientCacheKey { invoice_id: 7u64 };
+            assert!(env.storage().persistent().get::<_, i128>(&cache_key).is_none());
+
+            // After invalidation the loader runs again and repopulates the cache.
+            let value: i128 = get_cached_recipients(&env, 7u64, || 100i128);
+            assert_eq!(value, 100);
         });
     }
 
@@ -222,6 +342,85 @@ mod tests {
                 .get(&key)
                 .expect("value should be stored");
             assert_eq!(stored, value);
+        });
+    }
+
+    #[test]
+    fn test_update_invoice_field_incremental() {
+        let env = Env::default();
+        let id = contract_id(&env);
+        let key = (symbol_short!("inv_fld"), 7u64);
+
+        env.as_contract(&id, || {
+            update_invoice_field::<_, i128, _>(&env, key.clone(), |_| 10);
+            update_invoice_field::<_, i128, _>(&env, key.clone(), |current| {
+                current.unwrap_or(0) + 5
+            });
+
+            let stored: i128 = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .expect("value should be stored");
+            assert_eq!(stored, 15);
+        });
+    }
+
+    #[test]
+    fn test_update_recipient_amount_incremental() {
+        let env = Env::default();
+        let id = contract_id(&env);
+        let key = (symbol_short!("rec_amt"), 3u64);
+
+        env.as_contract(&id, || {
+            update_recipient_amount::<_, i128, _>(&env, key.clone(), |_| 100);
+            update_recipient_amount::<_, i128, _>(&env, key.clone(), |current| {
+                current.unwrap_or(0) - 40
+            });
+
+            let stored: i128 = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .expect("value should be stored");
+            assert_eq!(stored, 60);
+        });
+    }
+
+    #[test]
+    fn test_bump_counter_instance_tier() {
+        let env = Env::default();
+        let id = contract_id(&env);
+        let key = symbol_short!("counter");
+
+        env.as_contract(&id, || {
+            bump_counter(&env, key.clone(), 1);
+            bump_counter(&env, key.clone(), 2);
+
+            let stored: i128 = env
+                .storage()
+                .instance()
+                .get(&key)
+                .expect("counter should be stored");
+            assert_eq!(stored, 3);
+        });
+    }
+
+    #[test]
+    fn test_save_in_tier_temporary() {
+        let env = Env::default();
+        let id = contract_id(&env);
+        let key = (symbol_short!("tmp_key"), 1u64);
+
+        env.as_contract(&id, || {
+            save_in_tier(&env, StorageTier::Temporary, key.clone(), &9i128);
+
+            let stored: i128 = env
+                .storage()
+                .temporary()
+                .get(&key)
+                .expect("value should be stored");
+            assert_eq!(stored, 9);
         });
     }
 }

@@ -17,6 +17,22 @@
 //! | `AddressKey`  | persistent | `(address: Address)` singletons | ≤50      |
 //! | `CompoundKey` | persistent | two or three fields             | ≤50      |
 //!
+//! ## Tier placement policy (issues #948, #949)
+//! Keys are placed by access pattern, not by convenience:
+//!
+//! - **Instance** — small, hot, contract-wide config and counters that are
+//!   read on nearly every invocation (admin, pause flags, fees, token
+//!   addresses, aggregate stats). Instance storage is loaded once per
+//!   invocation, so keeping the payment-path config here avoids repeated
+//!   persistent reads.
+//! - **Persistent** — per-invoice and per-address state that must survive
+//!   archival and is only touched for the entities involved in a call.
+//!   Incremental updates (issue #948) write only the per-field keys that
+//!   actually changed instead of rewriting a whole invoice entry.
+//! - **Temporary** — ephemeral, per-transaction or short-lived counters
+//!   (reentrancy guard, event sequence numbers, rate-limit windows) that
+//!   can be discarded without affecting durable state.
+//!
 //! ## Collision safety
 //! Within each enum, Rust/XDR guarantees that every variant name is unique,
 //! so no two variants can produce the same serialised value. Cross-enum
@@ -186,6 +202,14 @@ pub enum StorageKey {
     ReentrancyGuard,
     /// Issue #526: Minimum number of recipients required per invoice.
     MinRecipients,
+
+    // --- Incremental update bookkeeping (issue #948) ---
+    /// Monotonic counter bumped on every incremental invoice-state write.
+    /// Lets readers detect stale cached views without re-reading the entry.
+    StateVersion,
+    /// Bitmask of per-field dirty flags for the most recent incremental
+    /// update, so a single flush can batch only the changed fields.
+    DirtyFieldMask,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +261,12 @@ pub enum InvoiceKey {
     /// Per-invoice event sequence counter — typed replacement for the former
     /// `(symbol_short!("ev_seq"), invoice_id)` inline key (issue #708).
     EvSeq(u64),
+    /// Issue #946: Cached recipient list for an invoice (persistent storage).
+    ///
+    /// Holds a serialized snapshot of the invoice's recipient list so hot
+    /// read paths avoid re-decoding the full invoice record. Invalidated
+    /// whenever the recipient list changes (see `RecipientsList`).
+    RecipientsCache(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +302,10 @@ pub enum AddressKey {
     CreatorVolMile(Address),
     /// Issue #527: Payment history for a contributor address.
     PayerHistory(Address),
+    /// Issue #948: Per-address running total, updated incrementally.
+    AddressTotal(Address),
+    /// Issue #948: Per-address last-activity ledger for incremental flushes.
+    AddressLastActive(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +330,57 @@ pub enum CompoundKey {
     Template(Address, Symbol),
     TemplateVersion(Address, Symbol, u32),
     TemplateVersionCount(Address, Symbol),
+    /// Issue #937: Marks a co-signer signature nonce as consumed.
+    ///
+    /// Keyed by `(invoice_id, signer)` so replay protection is scoped per
+    /// invoice and per signer. Presence of this key means the nonce has
+    /// already been used and the signature must be rejected.
+    UsedSignatureNonce(u64, Address),
+}
+
+// ---------------------------------------------------------------------------
+// Issue #945: Payment shard key helpers
+// ---------------------------------------------------------------------------
+
+/// Number of payment shards per invoice.
+///
+/// Shard allocation is deterministic: shard index for a payment is
+/// `payment_index % PAYMENT_SHARD_COUNT`, so a given payment always lands in
+/// the same shard and reads never need to probe more than one shard.
+pub const PAYMENT_SHARD_COUNT: u64 = 8;
+
+/// Returns the [`InvoiceKey::PaymentShard`] key for `(invoice_id, shard)`.
+///
+/// Layout: `PaymentShard(invoice_id, shard)` → `Vec<PaymentRecord>`.
+/// `shard` must be `< PAYMENT_SHARD_COUNT`; callers should derive it via
+/// [`payment_shard_index`] rather than picking a shard directly.
+#[inline]
+pub fn payment_shard_key(invoice_id: u64, shard: u64) -> InvoiceKey {
+    InvoiceKey::PaymentShard(invoice_id, shard)
+}
+
+/// Maps a payment's position within an invoice to its shard index.
+///
+/// Deterministic and allocation-free: `payment_index % PAYMENT_SHARD_COUNT`.
+#[inline]
+pub fn payment_shard_index(payment_index: u64) -> u64 {
+    payment_index % PAYMENT_SHARD_COUNT
+}
+
+/// Convenience: key for the shard that holds `payment_index` of `invoice_id`.
+#[inline]
+pub fn payment_shard_key_for(invoice_id: u64, payment_index: u64) -> InvoiceKey {
+    payment_shard_key(invoice_id, payment_shard_index(payment_index))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #944: Pagination cursor key helper
+// ---------------------------------------------------------------------------
+
+/// Returns the [`InvoiceKey::InvoiceListCursor`] key for `cursor_id`.
+#[inline]
+pub fn invoice_list_cursor_key(cursor_id: u64) -> InvoiceKey {
+    InvoiceKey::InvoiceListCursor(cursor_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +470,8 @@ mod tests {
             StorageKey::PlatformVolThresh, StorageKey::PlatformVolMile,
             StorageKey::CreatorVolThresh, StorageKey::UpgradeProposal,
             StorageKey::ProtocolFee, StorageKey::ReentrancyGuard,
-            StorageKey::MinRecipients,
+            StorageKey::MinRecipients, StorageKey::StateVersion,
+            StorageKey::DirtyFieldMask,
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -410,7 +496,7 @@ mod tests {
             InvoiceKey::RecipientsList(id), InvoiceKey::AmountsList(id),
             InvoiceKey::PaidFlags(id), InvoiceKey::MilestoneFlags(id),
             InvoiceKey::ArchiveMarker(id), InvoiceKey::CreatedLedger(id),
-            InvoiceKey::EvSeq(id),
+            InvoiceKey::EvSeq(id), InvoiceKey::RecipientsCache(id),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -434,6 +520,55 @@ mod tests {
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 0)),
             xdr_ik(&env, &InvoiceKey::PaymentShard(1, 1))
         );
+        assert_ne!(
+            xdr_ik(&env, &InvoiceKey::RecipientsCache(1)),
+            xdr_ik(&env, &InvoiceKey::RecipientsCache(2))
+        );
+    }
+
+    #[test]
+    fn used_signature_nonce_scoped_by_invoice_and_signer() {
+        let env = Env::default();
+        let a = soroban_sdk::Address::generate(&env);
+        let b = soroban_sdk::Address::generate(&env);
+        // Same signer, different invoice → distinct keys.
+        assert_ne!(
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, a.clone())),
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(2, a.clone()))
+        );
+        // Same invoice, different signer → distinct keys.
+        assert_ne!(
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, a.clone())),
+            xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, b.clone()))
+        );
+    }
+
+    #[test]
+    fn payment_shard_index_is_deterministic_and_bounded() {
+        for i in 0..(PAYMENT_SHARD_COUNT * 3) {
+            let shard = payment_shard_index(i);
+            assert!(shard < PAYMENT_SHARD_COUNT);
+            assert_eq!(shard, payment_shard_index(i));
+            assert_eq!(shard, i % PAYMENT_SHARD_COUNT);
+        }
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &payment_shard_key_for(7, 3)),
+            xdr_ik(&env, &payment_shard_key(7, 3))
+        );
+    }
+
+    #[test]
+    fn invoice_list_cursor_key_is_distinct() {
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &InvoiceKey::InvoiceListCursor(5))
+        );
+        assert_ne!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &invoice_list_cursor_key(6))
+        );
     }
 
     #[test]
@@ -455,6 +590,8 @@ mod tests {
             AddressKey::GlobalVelocity(addr.clone()),
             AddressKey::PauseExempt(addr.clone()),
             AddressKey::PayerHistory(addr.clone()),
+            AddressKey::AddressTotal(addr.clone()),
+            AddressKey::AddressLastActive(addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -571,6 +708,7 @@ mod tests {
             CompoundKey::ConfidentialPay(id, addr.clone()),
             CompoundKey::Delegation(id, addr.clone()),
             CompoundKey::PayerCooldown(id, addr.clone()),
+            CompoundKey::UsedSignatureNonce(id, addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
@@ -644,45 +782,76 @@ pub fn ev_seq_key(invoice_id: u64) -> InvoiceKey {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #943: allocation-free key constructors
+// Issue #948: Incremental state update keys
 // ---------------------------------------------------------------------------
-//
-// These helpers build the hot-path keys without any intermediate heap or
-// host-object allocation: the enum variant is constructed in place and the
-// `u64`/`Address` payload is moved straight into it. Callers that previously
-// did `InvoiceKey::Invoice(id)` can keep doing so — the constructors below
-// exist for call sites that want an explicit, documented hot-path entry point
-// and for benchmarking.
 
-/// Build a per-invoice key with no intermediate allocation.
-#[inline(always)]
-pub fn invoice_key(variant: fn(u64) -> InvoiceKey, invoice_id: u64) -> InvoiceKey {
-    variant(invoice_id)
+/// Per-invoice funded amount — persistent storage.
+///
+/// Written on its own when funding changes, so the full invoice entry does
+/// not need to be rewritten (issue #948).
+pub fn funded_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::FundedAmount(invoice_id)
 }
 
-/// Build a per-address key with no intermediate allocation.
-#[inline(always)]
-pub fn address_key(variant: fn(Address) -> AddressKey, address: Address) -> AddressKey {
-    variant(address)
+/// Per-invoice released amount — persistent storage.
+pub fn released_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::ReleasedAmount(invoice_id)
 }
 
-/// Build a compound `(u64, Address)` key with no intermediate allocation.
-#[inline(always)]
-pub fn compound_key_u64_addr(
-    variant: fn(u64, Address) -> CompoundKey,
-    invoice_id: u64,
-    address: Address,
-) -> CompoundKey {
-    variant(invoice_id, address)
+/// Per-invoice refunded amount — persistent storage.
+pub fn refunded_amount_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::RefundedAmount(invoice_id)
 }
 
-/// Build a compound `(Address, Address)` key with no intermediate allocation.
-#[inline(always)]
-pub fn compound_key_addr_addr(
-    variant: fn(Address, Address) -> CompoundKey,
-    first: Address,
-    second: Address,
-) -> CompoundKey {
-    variant(first, second)
+/// Per-invoice status discriminant — persistent storage.
+pub fn status_field_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::StatusField(invoice_id)
+}
+
+/// Per-invoice recipient count — persistent storage.
+pub fn recipient_count_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::RecipientCount(invoice_id)
+}
+
+/// Per-invoice paid-recipient count — persistent storage.
+pub fn paid_count_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::PaidCount(invoice_id)
+}
+
+/// Per-invoice last-modified ledger — persistent storage.
+pub fn last_modified_ledger_key(invoice_id: u64) -> InvoiceKey {
+    InvoiceKey::LastModifiedLedger(invoice_id)
+}
+
+/// Per-(invoice, recipient) paid flag — persistent storage.
+///
+/// Lets a single payout mark one recipient paid without rewriting the whole
+/// `PaidFlags` vector (issue #948).
+pub fn recipient_paid_key(invoice_id: u64, recipient: Address) -> CompoundKey {
+    CompoundKey::RecipientPaid(invoice_id, recipient)
+}
+
+/// Per-address running total — persistent storage.
+pub fn address_total_key(address: Address) -> AddressKey {
+    AddressKey::AddressTotal(address)
+}
+
+/// Per-address last-activity ledger — persistent storage.
+pub fn address_last_active_key(address: Address) -> AddressKey {
+    AddressKey::AddressLastActive(address)
+}
+
+/// Contract-wide incremental state version — instance storage.
+///
+/// Bumped on every incremental write so readers can detect stale views
+/// without re-reading the full entry (issue #948).
+pub fn state_version_key() -> StorageKey {
+    StorageKey::StateVersion
+}
+
+/// Bitmask of dirty per-field flags for the pending incremental flush —
+/// instance storage (issue #948).
+pub fn dirty_field_mask_key() -> StorageKey {
+    StorageKey::DirtyFieldMask
 }
 
