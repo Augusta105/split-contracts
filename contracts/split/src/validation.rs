@@ -16,6 +16,58 @@ pub const MAX_INVOICE_RECIPIENTS: u32 = 200;
 /// that would lock funds effectively forever.
 pub const MAX_DEADLINE_HORIZON_SECS: u64 = 315_360_000;
 
+// ---------------------------------------------------------------------------
+// Issue #933: Amount overflow protection
+// ---------------------------------------------------------------------------
+
+/// Largest factor an invoice amount is multiplied by in intermediate
+/// arithmetic: basis points (`10_000`) × the oracle rate scale (`1_000_000`).
+pub const MAX_AMOUNT_SCALE: i128 = 10_000_000_000;
+
+/// Issue #933: Maximum total of an invoice's `amounts`, in token base units.
+///
+/// `i128::MAX / MAX_AMOUNT_SCALE` ≈ 1.7 × 10^28, so `total * bps` and
+/// `total * ORACLE_RATE_SCALE * bps` can never overflow `i128`. This is still
+/// ~1.7 × 10^21 whole tokens at 7 decimals — far above any real asset supply.
+pub const MAX_INVOICE_TOTAL: i128 = i128::MAX / MAX_AMOUNT_SCALE;
+
+/// Issue #933: Sum `amounts`, failing instead of wrapping or panicking on overflow.
+///
+/// # Errors
+/// Returns [ContractError::ArithmeticOverflow] if the running total overflows `i128`.
+pub fn checked_sum_amounts(amounts: &Vec<i128>) -> Result<i128, ContractError> {
+    let mut total: i128 = 0;
+    for amt in amounts.iter() {
+        total = total
+            .checked_add(amt)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+    }
+    Ok(total)
+}
+
+/// Issue #933: Add `amount` to an accumulator (e.g. `invoice.funded`),
+/// failing instead of panicking on overflow.
+///
+/// # Errors
+/// Returns [ContractError::ArithmeticOverflow] if the sum overflows `i128`.
+pub fn checked_add_amount(acc: i128, amount: i128) -> Result<i128, ContractError> {
+    acc.checked_add(amount).ok_or(ContractError::ArithmeticOverflow)
+}
+
+/// Issue #933: Validate that an invoice's total stays within [`MAX_INVOICE_TOTAL`].
+/// Returns the total on success.
+///
+/// # Errors
+/// Returns [ContractError::ArithmeticOverflow] when the sum overflows `i128`
+/// or exceeds [`MAX_INVOICE_TOTAL`].
+pub fn validate_invoice_total(amounts: &Vec<i128>) -> Result<i128, ContractError> {
+    let total = checked_sum_amounts(amounts)?;
+    if total > MAX_INVOICE_TOTAL {
+        return Err(ContractError::ArithmeticOverflow);
+    }
+    Ok(total)
+}
+
 /// Issue #931: Validate the recipients and amounts arrays of an invoice.
 ///
 /// Checks, in order:
@@ -23,8 +75,10 @@ pub const MAX_DEADLINE_HORIZON_SECS: u64 = 315_360_000;
 /// 2. at least one recipient — [ContractError::EmptyRecipientList]
 /// 3. at most [`MAX_INVOICE_RECIPIENTS`] — [ContractError::BatchLimitExceeded]
 /// 4. every amount is strictly positive — [ContractError::ZeroAmountNotAllowed]
+/// 5. the total is within [`MAX_INVOICE_TOTAL`] — [ContractError::ArithmeticOverflow]
+///    (issue #933)
 ///
-/// Single pass over `amounts`, no allocation.
+/// No allocation.
 ///
 /// # Errors
 /// Returns the first failing check's error.
@@ -46,6 +100,7 @@ pub fn validate_recipients_and_amounts(
             return Err(ContractError::ZeroAmountNotAllowed);
         }
     }
+    validate_invoice_total(amounts)?;
     Ok(())
 }
 
@@ -656,6 +711,81 @@ mod tests {
                 Err(ContractError::InvalidRecipientAddress)
             );
         });
+    }
+
+    // --- amount overflow protection (issue #933) ---
+
+    #[test]
+    fn max_invoice_total_leaves_headroom_for_scaling() {
+        assert!(MAX_INVOICE_TOTAL.checked_mul(MAX_AMOUNT_SCALE).is_some());
+        assert!((MAX_INVOICE_TOTAL + 1).checked_mul(MAX_AMOUNT_SCALE).is_none());
+    }
+
+    #[test]
+    fn checked_sum_normal_values() {
+        let env = Env::default();
+        assert_eq!(checked_sum_amounts(&amts(&env, &[])), Ok(0));
+        assert_eq!(checked_sum_amounts(&amts(&env, &[1, 2, 3])), Ok(6));
+    }
+
+    #[test]
+    fn checked_sum_overflow_caught() {
+        let env = Env::default();
+        assert_eq!(
+            checked_sum_amounts(&amts(&env, &[i128::MAX, 1])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            checked_sum_amounts(&amts(&env, &[i128::MAX / 2 + 1, i128::MAX / 2 + 1])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(checked_sum_amounts(&amts(&env, &[i128::MAX])), Ok(i128::MAX));
+    }
+
+    #[test]
+    fn checked_add_amount_boundaries() {
+        assert_eq!(checked_add_amount(i128::MAX - 1, 1), Ok(i128::MAX));
+        assert_eq!(checked_add_amount(i128::MAX, 1), Err(ContractError::ArithmeticOverflow));
+        assert_eq!(checked_add_amount(0, 0), Ok(0));
+    }
+
+    #[test]
+    fn invoice_total_boundary() {
+        let env = Env::default();
+        assert_eq!(
+            validate_invoice_total(&amts(&env, &[MAX_INVOICE_TOTAL])),
+            Ok(MAX_INVOICE_TOTAL)
+        );
+        assert_eq!(
+            validate_invoice_total(&amts(&env, &[MAX_INVOICE_TOTAL - 1, 1])),
+            Ok(MAX_INVOICE_TOTAL)
+        );
+        assert_eq!(
+            validate_invoice_total(&amts(&env, &[MAX_INVOICE_TOTAL, 1])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            validate_invoice_total(&amts(&env, &[i128::MAX, i128::MAX])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn recipients_and_amounts_reject_total_above_limit() {
+        let env = Env::default();
+        let r = addrs(&env, 2);
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[MAX_INVOICE_TOTAL, 1])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[i128::MAX, i128::MAX])),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            validate_recipients_and_amounts(&r, &amts(&env, &[MAX_INVOICE_TOTAL - 1, 1])),
+            Ok(())
+        );
     }
 
     // --- assert_bps_sum (issue #623) ---

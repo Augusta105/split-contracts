@@ -257,8 +257,21 @@ Core inputs are validated before any storage is written. Each failure aborts wit
 | `deadline` ≤ current ledger timestamp | `DeadlinePassed` (3) |
 | `deadline` more than `MAX_DEADLINE_HORIZON_SECS` (~10 years) ahead | `InvalidDeadline` (67) |
 | a recipient has a malformed strkey or bad checksum, is an all-zero key, or is the contract itself (issue #932) | `InvalidRecipientAddress` (68) |
+| sum of `amounts` overflows `i128` or exceeds `MAX_INVOICE_TOTAL` (issue #933) | `ArithmeticOverflow` (40) |
 
 The same checks apply to `create_invoices_batch`. Recipient address validation also applies to `add_recipient`. The recipients/amounts checks also apply to `create_subscription` and `save_template`.
+
+**Amount limits (issue #933):**
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `MAX_AMOUNT_SCALE` | `10_000_000_000` | Largest factor applied to an amount in intermediate math: basis points (10⁴) × oracle rate scale (10⁶) |
+| `MAX_INVOICE_TOTAL` | `i128::MAX / MAX_AMOUNT_SCALE` ≈ 1.7 × 10²⁸ base units | Maximum sum of an invoice's `amounts` (~1.7 × 10²¹ whole tokens at 7 decimals) |
+
+Keeping totals under `MAX_INVOICE_TOTAL` means `total × bps` and `total × rate × bps` can never overflow. Overflow is also checked where amounts accumulate after creation:
+- `invoice.funded` updates in `pay`, `contribute`, `pay_with_token`, `bridge_pay`, `pool_pay` and `close_channel` use checked addition and fail with `ArithmeticOverflow` instead of trapping.
+- `add_recipient` rejects a new amount that would push the total past `MAX_INVOICE_TOTAL`.
+- `split_rules` basis-point totals are summed with checked arithmetic. A negative `Fixed` amount fails with `InvalidAmount`.
 
 ### `create_batch`
 

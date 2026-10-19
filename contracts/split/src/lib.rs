@@ -3023,7 +3023,8 @@ impl SplitContract {
         }
 
         if amount_applied > 0 {
-            invoice.funded += amount_applied;
+            invoice.funded = validation::checked_add_amount(invoice.funded, amount_applied)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             invoice.payments.push_back(types::Payment {
                 payer: payer.clone(),
                 amount: amount_applied,
@@ -5493,7 +5494,6 @@ impl SplitContract {
             );
         }
 
-        let _total_amount: i128 = amounts.iter().sum();
 
         // Issue #286: Verify no duplicate recipients
         for i in 0..recipients.len() {
@@ -5584,19 +5584,27 @@ impl SplitContract {
             );
             let total_amounts: i128 = amounts.iter().sum();
             assert!(total_amounts > 0, "total amounts must be positive");
+            // Issue #933: checked arithmetic so oversized or negative rules fail
+            // with a typed error instead of wrapping.
             let mut total_bps: u32 = 0;
             for rule in split_rules.iter() {
-                match rule {
+                let rule_bps: u32 = match rule {
                     SplitRule::Fixed(amt) => {
-                        total_bps += (amt as u128 * 10_000u128 / total_amounts as u128) as u32;
+                        if amt < 0 {
+                            panic_with_error!(env, ContractError::InvalidAmount);
+                        }
+                        (amt as u128)
+                            .checked_mul(10_000u128)
+                            .map(|v| v / total_amounts as u128)
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow))
                     }
-                    SplitRule::Percentage(bps) => {
-                        total_bps += bps;
-                    }
-                    SplitRule::Tiered(_, bps) => {
-                        total_bps += bps;
-                    }
-                }
+                    SplitRule::Percentage(bps) => bps,
+                    SplitRule::Tiered(_, bps) => bps,
+                };
+                total_bps = total_bps
+                    .checked_add(rule_bps)
+                    .unwrap_or_else(|| panic_with_error!(env, ContractError::ArithmeticOverflow));
             }
             assert!(
                 total_bps == 10_000,
@@ -6692,7 +6700,8 @@ impl SplitContract {
                 .persistent()
                 .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-            invoice.funded += net_paid;
+            invoice.funded = validation::checked_add_amount(invoice.funded, net_paid)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             let cumulative_key = cumulative_contributed_key(invoice_id);
             let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
             env.storage()
@@ -7491,7 +7500,8 @@ impl SplitContract {
 
         // Capture funded total before and after mutation (used for milestone check below).
         let prev_funded = invoice.funded;
-        invoice.funded += credited_amount;
+        invoice.funded = validation::checked_add_amount(invoice.funded, credited_amount)
+            .unwrap_or_else(|e| env.panic_with_error(e));
 
         // Track lifetime contributions separately; never decremented on withdrawal/refund.
         let cumulative_key = cumulative_contributed_key(invoice_id);
@@ -7747,7 +7757,8 @@ impl SplitContract {
             .persistent()
             .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-        invoice.funded += credited_amount;
+        invoice.funded = validation::checked_add_amount(invoice.funded, credited_amount)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let cumulative_key = cumulative_contributed_key(invoice_id);
         let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
         env.storage()
@@ -7854,7 +7865,8 @@ impl SplitContract {
             .persistent()
             .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-        invoice.funded += converted;
+        invoice.funded = validation::checked_add_amount(invoice.funded, converted)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let cumulative_key = cumulative_contributed_key(invoice_id);
         let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
         env.storage()
@@ -7972,7 +7984,8 @@ impl SplitContract {
                 .persistent()
                 .set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
 
-            inv.funded += p.amount;
+            inv.funded = validation::checked_add_amount(inv.funded, p.amount)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             let cumulative_key = cumulative_contributed_key(p.invoice_id);
             let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
             env.storage()
@@ -12110,6 +12123,14 @@ impl SplitContract {
             "cannot add recipient after payment received"
         );
         assert!(amount > 0, "amount must be positive");
+        // Issue #933: the new recipient must not push the invoice total past
+        // `MAX_INVOICE_TOTAL` (or overflow i128).
+        let new_total = validation::checked_sum_amounts(&invoice.amounts)
+            .and_then(|t| validation::checked_add_amount(t, amount))
+            .unwrap_or_else(|e| env.panic_with_error(e));
+        if new_total > validation::MAX_INVOICE_TOTAL {
+            env.panic_with_error(ContractError::ArithmeticOverflow);
+        }
 
         let token = invoice.tokens.get(0).expect("no token");
 
