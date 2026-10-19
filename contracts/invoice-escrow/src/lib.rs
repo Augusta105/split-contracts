@@ -5,6 +5,12 @@
 //! - Automatic fund release when fully funded
 //! - Deadline-based refund fallback
 //! - **Upgradable admin authority** via a two-step `transfer_admin` flow
+//! - **Co-signer approval**: optional N-of-M sign-off gating release
+//! - **Oracle condition guards**: optional price-feed condition, with a
+//!   fallback oracle, that must hold before release
+//! - **Scheduled release**: optional time + ledger-count delay before release
+//! - **Refund grace period**: configurable delay after the deadline before
+//!   refunds can be processed, with admin extend / waive overrides
 //!
 //! # Admin Transfer Flow
 //!
@@ -18,6 +24,7 @@
 #![no_std]
 
 mod errors;
+mod oracle;
 mod types;
 
 #[cfg(test)]
@@ -27,7 +34,12 @@ use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec,
 };
-use types::{BlacklistEntry, EscrowInvoice, EscrowReleased, EscrowStatus, RefundReason};
+use oracle::PriceOracleClient;
+use types::{
+    ApprovalStatus, BlacklistEntry, CosignerApproval, EscrowInvoice, EscrowReleased, EscrowStatus,
+    OracleCondition, OracleReading, OracleSource, PriceComparator, PriceData, RefundGrace,
+    RefundGraceStatus, ReleaseSchedule, ScheduleStatus,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key helpers
@@ -48,6 +60,11 @@ fn counter_key() -> Symbol {
     symbol_short!("counter")
 }
 
+/// Instance storage: default refund grace period (seconds) applied to new invoices.
+fn default_grace_key() -> Symbol {
+    symbol_short!("grace_def")
+}
+
 /// Persistent storage: per-invoice record keyed by `(escrow, id)`.
 fn invoice_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("escrow"), id)
@@ -63,6 +80,31 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
     (symbol_short!("blacklist"), payer.clone())
 }
 
+/// Persistent storage: co-signer approval record for an invoice.
+fn approval_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("approval"), id)
+}
+
+/// Persistent storage: oracle release condition for an invoice.
+fn oracle_cond_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("orc_cond"), id)
+}
+
+/// Persistent storage: most recent successful oracle evaluation for an invoice.
+fn oracle_read_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("orc_read"), id)
+}
+
+/// Persistent storage: release schedule for an invoice.
+fn schedule_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("schedule"), id)
+}
+
+/// Persistent storage: refund grace configuration for an invoice.
+fn grace_key(id: u64) -> (Symbol, u64) {
+    (symbol_short!("grace"), id)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -70,6 +112,20 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
 /// Number of ledgers during which a blacklisted payer can submit an appeal.
 /// ~30 minutes at 5s ledger close time.
 const APPEAL_WINDOW_LEDGERS: u32 = 360;
+
+/// Maximum number of co-signers on a single invoice. Bounds the linear
+/// membership scans performed on every vote.
+const MAX_COSIGNERS: u32 = 20;
+
+/// Maximum ledger delay for a release schedule (~1 year at 5s ledgers).
+const MAX_SCHEDULE_LEDGERS: u32 = 6_312_000;
+
+/// Extra ledgers of TTL kept on a scheduled invoice beyond its unlock
+/// ledger (~1 day), so the record is still live when it becomes due.
+const SCHEDULE_TTL_BUFFER_LEDGERS: u32 = 17_280;
+
+/// Maximum refund grace period, including admin extensions (30 days).
+const MAX_REFUND_GRACE_SECS: u64 = 30 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -94,6 +150,231 @@ fn get_invoice(env: &Env, id: u64) -> Result<EscrowInvoice, Error> {
 
 fn save_invoice(env: &Env, id: u64, invoice: &EscrowInvoice) {
     env.storage().persistent().set(&invoice_key(id), invoice);
+}
+
+/// Returns `true` while the invoice can still accept configuration changes
+/// and votes (i.e. it has not been released, refunded or cancelled).
+fn is_open(invoice: &EscrowInvoice) -> bool {
+    invoice.status == EscrowStatus::Pending || invoice.status == EscrowStatus::Active
+}
+
+fn get_approval(env: &Env, id: u64) -> Option<CosignerApproval> {
+    env.storage().persistent().get(&approval_key(id))
+}
+
+fn save_approval(env: &Env, id: u64, approval: &CosignerApproval) {
+    env.storage().persistent().set(&approval_key(id), approval);
+}
+
+/// Recompute `approval.status` from the current tallies.
+fn recompute_approval_status(approval: &mut CosignerApproval) {
+    let remaining = approval.signers.len() - approval.rejections.len();
+    approval.status = if approval.approvals.len() >= approval.threshold {
+        ApprovalStatus::Approved
+    } else if remaining < approval.threshold {
+        ApprovalStatus::Rejected
+    } else {
+        ApprovalStatus::Pending
+    };
+}
+
+fn get_oracle_condition(env: &Env, id: u64) -> Option<OracleCondition> {
+    env.storage().persistent().get(&oracle_cond_key(id))
+}
+
+/// Query a single oracle and validate the returned price.
+///
+/// Uses `try_lastprice` so that a panicking, missing or incompatible oracle
+/// contract surfaces as [`Error::OracleUnavailable`] instead of aborting.
+fn read_oracle(env: &Env, oracle: &Address, asset: &Address, max_staleness_secs: u64) -> Result<PriceData, Error> {
+    let client = PriceOracleClient::new(env, oracle);
+    let data = match client.try_lastprice(asset) {
+        Ok(Ok(Some(data))) => data,
+        _ => return Err(Error::OracleUnavailable),
+    };
+
+    let now = env.ledger().timestamp();
+    if data.price <= 0 || data.timestamp > now {
+        return Err(Error::OracleInvalidPrice);
+    }
+    if now - data.timestamp > max_staleness_secs {
+        return Err(Error::OracleStalePrice);
+    }
+    Ok(data)
+}
+
+/// Evaluate an oracle condition, falling back to the secondary oracle when
+/// the primary cannot supply a usable price.
+///
+/// When both oracles fail, the error from the last oracle tried is returned
+/// (the fallback's if one is configured, otherwise the primary's).
+fn evaluate_oracle_condition(env: &Env, id: u64, cond: &OracleCondition) -> Result<OracleReading, Error> {
+    let (data, source) = match read_oracle(env, &cond.oracle, &cond.asset, cond.max_staleness_secs) {
+        Ok(data) => (data, OracleSource::Primary),
+        Err(primary_err) => {
+            let fallback = cond.fallback_oracle.as_ref().ok_or(primary_err)?;
+            emit_oracle_fallback(env, id, primary_err);
+            let data = read_oracle(env, fallback, &cond.asset, cond.max_staleness_secs)?;
+            (data, OracleSource::Fallback)
+        }
+    };
+
+    let condition_met = match cond.comparator {
+        PriceComparator::GreaterOrEqual => data.price >= cond.threshold_price,
+        PriceComparator::LessOrEqual => data.price <= cond.threshold_price,
+    };
+    Ok(OracleReading {
+        price: data.price,
+        price_timestamp: data.timestamp,
+        source,
+        condition_met,
+        checked_at: env.ledger().timestamp(),
+    })
+}
+
+fn get_schedule(env: &Env, id: u64) -> Option<ReleaseSchedule> {
+    env.storage().persistent().get(&schedule_key(id))
+}
+
+/// Persist a schedule and keep it (and its invoice) alive at least until
+/// the unlock ledger plus a buffer, capped at the network's maximum TTL.
+fn save_schedule(env: &Env, id: u64, schedule: &ReleaseSchedule) {
+    let storage = env.storage().persistent();
+    storage.set(&schedule_key(id), schedule);
+
+    let ledgers_left = schedule
+        .unlock_ledger
+        .saturating_sub(env.ledger().sequence());
+    let extend_to = ledgers_left
+        .saturating_add(SCHEDULE_TTL_BUFFER_LEDGERS)
+        .min(env.storage().max_ttl());
+    storage.extend_ttl(&schedule_key(id), extend_to, extend_to);
+    storage.extend_ttl(&invoice_key(id), extend_to, extend_to);
+}
+
+/// Check every release gate configured on the invoice. Returns `Ok(())`
+/// when the invoice may be released now.
+///
+/// Gates are checked cheapest-first: release schedule, co-signer approval,
+/// then the oracle condition (which requires a cross-contract call).
+fn check_release_gates(env: &Env, id: u64) -> Result<(), Error> {
+    if let Some(schedule) = get_schedule(env, id) {
+        if schedule.status == ScheduleStatus::Scheduled {
+            if env.ledger().timestamp() < schedule.release_at {
+                return Err(Error::ReleaseNotYetDue);
+            }
+            if env.ledger().sequence() < schedule.unlock_ledger {
+                return Err(Error::ScheduleLedgerNotReached);
+            }
+        }
+    }
+    if let Some(approval) = get_approval(env, id) {
+        match approval.status {
+            ApprovalStatus::Approved => {}
+            ApprovalStatus::Pending => return Err(Error::ApprovalRequired),
+            ApprovalStatus::Rejected => return Err(Error::ApprovalRejected),
+        }
+    }
+    if let Some(cond) = get_oracle_condition(env, id) {
+        let reading = evaluate_oracle_condition(env, id, &cond)?;
+        env.storage().persistent().set(&oracle_read_key(id), &reading);
+        if !reading.condition_met {
+            return Err(Error::OracleConditionNotMet);
+        }
+    }
+    Ok(())
+}
+
+/// Shared implementation of `approve_release` / `reject_release`.
+fn cast_vote(env: &Env, signer: Address, invoice_id: u64, approve: bool) -> Result<ApprovalStatus, Error> {
+    signer.require_auth();
+    let invoice = get_invoice(env, invoice_id)?;
+    if !is_open(&invoice) {
+        return Err(Error::InvalidStatus);
+    }
+    let mut approval = get_approval(env, invoice_id).ok_or(Error::NoCosigners)?;
+    if !approval.signers.contains(&signer) {
+        return Err(Error::NotCosigner);
+    }
+    if approval.approvals.contains(&signer) || approval.rejections.contains(&signer) {
+        return Err(Error::AlreadyVoted);
+    }
+
+    let action = if approve {
+        approval.approvals.push_back(signer.clone());
+        symbol_short!("approved")
+    } else {
+        approval.rejections.push_back(signer.clone());
+        symbol_short!("rejected")
+    };
+
+    let old_status = approval.status.clone();
+    recompute_approval_status(&mut approval);
+    approval.updated_ledger = env.ledger().sequence();
+    save_approval(env, invoice_id, &approval);
+
+    emit_cosigner_vote(env, action, invoice_id, &signer, &approval);
+    if old_status != approval.status {
+        emit_approval_status_changed(env, invoice_id, &old_status, &approval.status);
+    }
+    Ok(approval.status)
+}
+
+fn get_grace(env: &Env, id: u64) -> Option<RefundGrace> {
+    env.storage().persistent().get(&grace_key(id))
+}
+
+fn save_grace(env: &Env, id: u64, grace: &RefundGrace) {
+    env.storage().persistent().set(&grace_key(id), grace);
+}
+
+/// Timestamp after which refunds are allowed: the deadline plus any
+/// un-waived grace period.
+fn refund_opens_at(invoice: &EscrowInvoice, grace: &Option<RefundGrace>) -> u64 {
+    match grace {
+        Some(g) if !g.waived => invoice
+            .deadline
+            .saturating_add(g.grace_secs)
+            .saturating_add(g.extension_secs),
+        _ => invoice.deadline,
+    }
+}
+
+fn grace_status(env: &Env, invoice: &EscrowInvoice, grace: &Option<RefundGrace>) -> RefundGraceStatus {
+    let g = match grace {
+        Some(g) if g.grace_secs > 0 || g.extension_secs > 0 || g.waived => g,
+        _ => return RefundGraceStatus::NoGrace,
+    };
+    let now = env.ledger().timestamp();
+    if g.waived {
+        RefundGraceStatus::Waived
+    } else if now <= invoice.deadline {
+        RefundGraceStatus::NotStarted
+    } else if now <= refund_opens_at(invoice, grace) {
+        RefundGraceStatus::Active
+    } else {
+        RefundGraceStatus::Elapsed
+    }
+}
+
+/// Mark the invoice released and transfer `total_amount` to the creator.
+fn execute_release(env: &Env, id: u64, invoice: &mut EscrowInvoice) -> (Address, i128) {
+    let total = invoice.total_amount;
+    let creator = invoice.creator.clone();
+    invoice.status = EscrowStatus::Released;
+    save_invoice(env, id, invoice);
+    let token_client = token::Client::new(env, &invoice.token);
+    token_client.transfer(&env.current_contract_address(), &creator, &total);
+    emit_released(env, id, total);
+
+    if let Some(mut schedule) = get_schedule(env, id) {
+        if schedule.status == ScheduleStatus::Scheduled {
+            schedule.status = ScheduleStatus::Executed;
+            env.storage().persistent().set(&schedule_key(id), &schedule);
+            emit_schedule_executed(env, id);
+        }
+    }
+    (creator, total)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +437,108 @@ fn emit_refunded(env: &Env, id: u64, payer: &Address, amount: i128, reason: &Ref
     env.events().publish(
         (symbol_short!("escrow"), symbol_short!("refunded"), id),
         (payer.clone(), amount, reason.clone()),
+    );
+}
+
+/// Topics: `(escrow, cosig_set, id)` — Data: `(signers, threshold)`
+fn emit_cosigners_set(env: &Env, id: u64, signers: &Vec<Address>, threshold: u32) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("cosig_set"), id),
+        (signers.clone(), threshold),
+    );
+}
+
+/// Topics: `(escrow, <action>, id)` — Data: `(signer, approvals, rejections, status)`
+///
+/// `action` is one of `approved`, `rejected` or `revoked`.
+fn emit_cosigner_vote(env: &Env, action: Symbol, id: u64, signer: &Address, approval: &CosignerApproval) {
+    env.events().publish(
+        (symbol_short!("escrow"), action, id),
+        (
+            signer.clone(),
+            approval.approvals.len(),
+            approval.rejections.len(),
+            approval.status.clone(),
+        ),
+    );
+}
+
+/// Topics: `(escrow, appr_stat, id)` — Data: `(old_status, new_status)`
+fn emit_approval_status_changed(env: &Env, id: u64, old: &ApprovalStatus, new: &ApprovalStatus) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("appr_stat"), id),
+        (old.clone(), new.clone()),
+    );
+}
+
+/// Topics: `(escrow, orc_set, id)` — Data: `(oracle, fallback_oracle, asset, threshold_price)`
+fn emit_oracle_condition_set(env: &Env, id: u64, cond: &OracleCondition) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_set"), id),
+        (
+            cond.oracle.clone(),
+            cond.fallback_oracle.clone(),
+            cond.asset.clone(),
+            cond.threshold_price,
+        ),
+    );
+}
+
+/// Topics: `(escrow, orc_clear, id)` — Data: `admin`
+fn emit_oracle_condition_cleared(env: &Env, id: u64, admin: &Address) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_clear"), id),
+        admin.clone(),
+    );
+}
+
+/// Topics: `(escrow, orc_fback, id)` — Data: primary oracle error code
+fn emit_oracle_fallback(env: &Env, id: u64, primary_err: Error) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("orc_fback"), id),
+        primary_err as u32,
+    );
+}
+
+/// Topics: `(escrow, sched_set, id)` — Data: `(release_at, unlock_ledger)`
+fn emit_schedule_set(env: &Env, id: u64, schedule: &ReleaseSchedule) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_set"), id),
+        (schedule.release_at, schedule.unlock_ledger),
+    );
+}
+
+/// Topics: `(escrow, sched_cnl, id)` — Data: ledger sequence
+fn emit_schedule_cancelled(env: &Env, id: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_cnl"), id),
+        env.ledger().sequence(),
+    );
+}
+
+/// Topics: `(escrow, sched_exe, id)` — Data: `(timestamp, ledger)`
+fn emit_schedule_executed(env: &Env, id: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("sched_exe"), id),
+        (env.ledger().timestamp(), env.ledger().sequence()),
+    );
+}
+
+/// Topics: `(escrow, grace_def)` — Data: `grace_secs`
+fn emit_default_grace_set(env: &Env, grace_secs: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("grace_def")),
+        grace_secs,
+    );
+}
+
+/// Topics: `(escrow, <action>, id)` — Data: `(grace_secs, extension_secs, waived)`
+///
+/// `action` is one of `grace_set`, `grace_ext` or `grace_wvd`.
+fn emit_grace_changed(env: &Env, action: Symbol, id: u64, grace: &RefundGrace) {
+    env.events().publish(
+        (symbol_short!("escrow"), action, id),
+        (grace.grace_secs, grace.extension_secs, grace.waived),
     );
 }
 
@@ -331,6 +714,9 @@ impl InvoiceEscrowContract {
     /// # Errors
     /// * [`Error::NotInitialized`]   — Contract not initialized.
     /// * [`Error::InvalidTotalAmount`] — `total_amount` ≤ 0.
+    /// * [`Error::DeadlinePassed`]   — `deadline` is not in the future.
+    /// * [`Error::DeadlineOutOfRange`] — `deadline` exceeds the maximum
+    ///   horizon of 365 days from the current ledger timestamp.
     pub fn create_invoice(
         env: Env,
         creator: Address,
@@ -344,6 +730,7 @@ impl InvoiceEscrowContract {
         if total_amount <= 0 {
             return Err(Error::InvalidTotalAmount);
         }
+        validate_deadline(&env, deadline)?;
         creator.require_auth();
 
         let id: u64 = env
@@ -364,6 +751,26 @@ impl InvoiceEscrowContract {
             refund_reason: None,
         };
         save_invoice(&env, id, &invoice);
+
+        // Snapshot the current default grace period so later changes to the
+        // default never alter the terms of an existing invoice.
+        let default_grace: u64 = env
+            .storage()
+            .instance()
+            .get(&default_grace_key())
+            .unwrap_or(0);
+        if default_grace > 0 {
+            save_grace(
+                &env,
+                id,
+                &RefundGrace {
+                    grace_secs: default_grace,
+                    extension_secs: 0,
+                    waived: false,
+                },
+            );
+        }
+
         emit_invoice_created(&env, id, &creator, total_amount, deadline);
         Ok(id)
     }
@@ -441,14 +848,11 @@ impl InvoiceEscrowContract {
 
         emit_deposited(&env, invoice_id, &payer, amount, new_funded);
 
-        // Auto-release on full funding.
-        if new_funded >= invoice.total_amount {
-            let total = invoice.total_amount;
-            let creator = invoice.creator.clone();
-            invoice.status = EscrowStatus::Released;
-            save_invoice(&env, invoice_id, &invoice);
-            token_client.transfer(&env.current_contract_address(), &creator, &total);
-            emit_released(&env, invoice_id, total);
+        // Auto-release on full funding, unless a release gate (e.g. pending
+        // co-signer approval) still blocks it. A gated invoice stays `Active`
+        // and fully funded until `release` is called once the gate clears.
+        if new_funded >= invoice.total_amount && check_release_gates(&env, invoice_id).is_ok() {
+            execute_release(&env, invoice_id, &mut invoice);
         } else {
             save_invoice(&env, invoice_id, &invoice);
         }
@@ -459,7 +863,8 @@ impl InvoiceEscrowContract {
     /// Release funds to the creator once the invoice is fully funded.
     ///
     /// Anyone may call this after the invoice reaches `total_amount`. Useful
-    /// if auto-release did not fire (e.g. due to separate partial deposits).
+    /// if auto-release did not fire (e.g. due to separate partial deposits,
+    /// or because a release gate was still closed when funding completed).
     ///
     /// All preconditions are validated before any storage write or token
     /// transfer, so a failed release leaves state consistent.
@@ -468,6 +873,13 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice was already released/refunded/cancelled.
     /// * [`Error::InsufficientFunding`] — Not fully funded yet.
+    /// * [`Error::ApprovalRequired`]   — Co-signer threshold not yet reached.
+    /// * [`Error::ApprovalRejected`]   — Co-signers rejected the release.
+    /// * [`Error::ReleaseNotYetDue`]  — Scheduled release time not reached.
+    /// * [`Error::ScheduleLedgerNotReached`] — Scheduled ledger delay not elapsed.
+    /// * [`Error::OracleConditionNotMet`] — Oracle price fails the condition.
+    /// * [`Error::OracleUnavailable`] / [`Error::OracleStalePrice`] /
+    ///   [`Error::OracleInvalidPrice`] — No usable oracle price.
     pub fn release(env: Env, invoice_id: u64) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
@@ -481,16 +893,9 @@ impl InvoiceEscrowContract {
         if invoice.funded_amount < invoice.total_amount {
             return Err(Error::InsufficientFunding);
         }
+        check_release_gates(&env, invoice_id)?;
 
-        // --- Mutations begin here. ---
-        let total = invoice.total_amount;
-        let creator = invoice.creator.clone();
-        invoice.status = EscrowStatus::Released;
-        save_invoice(&env, invoice_id, &invoice);
-
-        let token_client = token::Client::new(&env, &invoice.token);
-        token_client.transfer(&env.current_contract_address(), &creator, &total);
-        emit_released(&env, invoice_id, total);
+        let (creator, total) = execute_release(&env, invoice_id, &mut invoice);
 
         // Emit structured EscrowReleased event for off-chain indexers.
         env.events().publish(
@@ -508,8 +913,8 @@ impl InvoiceEscrowContract {
     /// Refund all depositors after the deadline passes without full funding.
     ///
     /// Iterates over `payers` and returns each payer's recorded deposit.
-    /// Callable by anyone once the deadline has passed and the invoice is not
-    /// already released.
+    /// Callable by anyone once the deadline — and any refund grace period
+    /// that follows it — has passed and the invoice is not already released.
     ///
     /// The `reason` is persisted on the invoice and emitted with each refund
     /// event so off-chain indexers can attribute the refund.
@@ -526,12 +931,9 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice already released or refunded.
     /// * [`Error::DeadlineNotPassed`]  — Deadline has not expired yet.
-    pub fn refund(
-        env: Env,
-        invoice_id: u64,
-        payers: Vec<Address>,
-        reason: RefundReason,
-    ) -> Result<(), Error> {
+    /// * [`Error::RefundGraceActive`]  — Deadline passed but the grace period
+    ///   is still running (and has not been waived).
+    pub fn refund(env: Env, invoice_id: u64, payers: Vec<Address>) -> Result<(), Error> {
         let mut invoice = get_invoice(&env, invoice_id)?;
 
         // --- Validate all preconditions before any mutation. ---
@@ -541,8 +943,12 @@ impl InvoiceEscrowContract {
         {
             return Err(Error::InvalidStatus);
         }
-        if env.ledger().timestamp() <= invoice.deadline {
+        let now = env.ledger().timestamp();
+        if now <= invoice.deadline {
             return Err(Error::DeadlineNotPassed);
+        }
+        if now <= refund_opens_at(&invoice, &get_grace(&env, invoice_id)) {
+            return Err(Error::RefundGraceActive);
         }
 
         // --- Mutations begin here. ---
@@ -600,6 +1006,484 @@ impl InvoiceEscrowContract {
         // --- Mutations begin here. ---
         invoice.status = EscrowStatus::Cancelled;
         save_invoice(&env, invoice_id, &invoice);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Co-signer approval
+    // -----------------------------------------------------------------------
+
+    /// Require N-of-M co-signer approval before the invoice can be released.
+    ///
+    /// Only the invoice creator may configure co-signers, and only while the
+    /// invoice is open and no co-signer has voted yet. Calling again before
+    /// any vote replaces the previous configuration.
+    ///
+    /// # Arguments
+    /// * `invoice_id` — Target invoice.
+    /// * `signers`    — Distinct co-signer addresses (1..=`MAX_COSIGNERS`).
+    /// * `threshold`  — Approvals required, in `1..=signers.len()`.
+    ///
+    /// # Events
+    /// Emits `(escrow, cosig_set, id)` with `(signers, threshold)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]       — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]         — Invoice is no longer open.
+    /// * [`Error::InvalidCosignerConfig`] — Bad signer list or threshold.
+    /// * [`Error::CosignersLocked`]       — A co-signer has already voted.
+    pub fn set_cosigners(
+        env: Env,
+        invoice_id: u64,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let count = signers.len();
+        if count == 0 || count > MAX_COSIGNERS || threshold == 0 || threshold > count {
+            return Err(Error::InvalidCosignerConfig);
+        }
+        for i in 0..count {
+            let signer = signers.get_unchecked(i);
+            for j in (i + 1)..count {
+                if signers.get_unchecked(j) == signer {
+                    return Err(Error::InvalidCosignerConfig);
+                }
+            }
+        }
+
+        if let Some(existing) = get_approval(&env, invoice_id) {
+            if !existing.approvals.is_empty() || !existing.rejections.is_empty() {
+                return Err(Error::CosignersLocked);
+            }
+        }
+
+        let approval = CosignerApproval {
+            signers: signers.clone(),
+            threshold,
+            approvals: Vec::new(&env),
+            rejections: Vec::new(&env),
+            status: ApprovalStatus::Pending,
+            updated_ledger: env.ledger().sequence(),
+        };
+        save_approval(&env, invoice_id, &approval);
+        emit_cosigners_set(&env, invoice_id, &signers, threshold);
+        Ok(())
+    }
+
+    /// Approve the release of an invoice as one of its co-signers.
+    ///
+    /// The signer authenticates via `require_auth` and must be in the
+    /// configured signer list. Each co-signer may vote once; duplicate votes
+    /// are rejected, so concurrent or replayed approvals cannot inflate the
+    /// tally. When the threshold is reached the status becomes `Approved`.
+    ///
+    /// Approving does not release funds by itself — call [`Self::release`]
+    /// once the invoice is fully funded and approved.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::NoCosigners`]     — No co-signers configured.
+    /// * [`Error::NotCosigner`]     — `signer` is not a configured co-signer.
+    /// * [`Error::AlreadyVoted`]    — `signer` already approved or rejected.
+    pub fn approve_release(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        cast_vote(&env, signer, invoice_id, true)
+    }
+
+    /// Reject the release of an invoice as one of its co-signers.
+    ///
+    /// Once enough co-signers reject that the threshold can no longer be
+    /// reached, the status becomes `Rejected` and release is blocked.
+    ///
+    /// # Errors
+    /// Same as [`Self::approve_release`].
+    pub fn reject_release(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        cast_vote(&env, signer, invoice_id, false)
+    }
+
+    /// Withdraw a previously cast approval or rejection.
+    ///
+    /// Allowed only while the invoice is open (not yet released). The status
+    /// is recomputed, so revoking an approval can move `Approved` back to
+    /// `Pending`, and revoking a rejection can move `Rejected` back to
+    /// `Pending`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::NoCosigners`]     — No co-signers configured.
+    /// * [`Error::NotCosigner`]     — `signer` is not a configured co-signer.
+    /// * [`Error::NotVoted`]        — `signer` has no vote to revoke.
+    pub fn revoke_vote(env: Env, signer: Address, invoice_id: u64) -> Result<ApprovalStatus, Error> {
+        signer.require_auth();
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        let mut approval = get_approval(&env, invoice_id).ok_or(Error::NoCosigners)?;
+        if !approval.signers.contains(&signer) {
+            return Err(Error::NotCosigner);
+        }
+
+        if let Some(idx) = approval.approvals.first_index_of(&signer) {
+            approval.approvals.remove(idx);
+        } else if let Some(idx) = approval.rejections.first_index_of(&signer) {
+            approval.rejections.remove(idx);
+        } else {
+            return Err(Error::NotVoted);
+        }
+
+        let old_status = approval.status.clone();
+        recompute_approval_status(&mut approval);
+        approval.updated_ledger = env.ledger().sequence();
+        save_approval(&env, invoice_id, &approval);
+
+        emit_cosigner_vote(&env, symbol_short!("revoked"), invoice_id, &signer, &approval);
+        if old_status != approval.status {
+            emit_approval_status_changed(&env, invoice_id, &old_status, &approval.status);
+        }
+        Ok(approval.status)
+    }
+
+    // -----------------------------------------------------------------------
+    // Oracle condition guards
+    // -----------------------------------------------------------------------
+
+    /// Attach (or replace) a price condition that must hold before release.
+    ///
+    /// Only the creator may set the condition, and only while the invoice is
+    /// still `Pending` (no deposits yet), so payers always fund against a
+    /// known condition.
+    ///
+    /// # Events
+    /// Emits `(escrow, orc_set, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]     — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]       — Invoice already has deposits or is closed.
+    /// * [`Error::InvalidOracleConfig`] — Non-positive threshold, zero
+    ///   staleness window, or fallback equal to the primary oracle.
+    pub fn set_oracle_condition(env: Env, invoice_id: u64, condition: OracleCondition) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if invoice.status != EscrowStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if condition.threshold_price <= 0
+            || condition.max_staleness_secs == 0
+            || condition.fallback_oracle.as_ref() == Some(&condition.oracle)
+        {
+            return Err(Error::InvalidOracleConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&oracle_cond_key(invoice_id), &condition);
+        emit_oracle_condition_set(&env, invoice_id, &condition);
+        Ok(())
+    }
+
+    /// Admin override: remove an invoice's oracle condition.
+    ///
+    /// Intended as the last-resort fallback when both the primary and
+    /// fallback oracles are permanently unavailable, so funds are not locked
+    /// forever. Any stored reading is cleared as well.
+    ///
+    /// # Events
+    /// Emits `(escrow, orc_clear, id)` with the admin address.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]    — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]   — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]     — Invoice is no longer open.
+    /// * [`Error::NoOracleCondition`] — No condition to clear.
+    pub fn clear_oracle_condition(env: Env, invoice_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        let admin = require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        if get_oracle_condition(&env, invoice_id).is_none() {
+            return Err(Error::NoOracleCondition);
+        }
+
+        env.storage().persistent().remove(&oracle_cond_key(invoice_id));
+        env.storage().persistent().remove(&oracle_read_key(invoice_id));
+        emit_oracle_condition_cleared(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Evaluate the invoice's oracle condition now without changing state.
+    ///
+    /// Returns the reading (including whether the condition holds) or the
+    /// oracle error that would block release.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]   — Unknown invoice ID.
+    /// * [`Error::NoOracleCondition`] — No condition configured.
+    /// * [`Error::OracleUnavailable`] / [`Error::OracleStalePrice`] /
+    ///   [`Error::OracleInvalidPrice`] — No usable oracle price.
+    pub fn check_oracle_condition(env: Env, invoice_id: u64) -> Result<OracleReading, Error> {
+        get_invoice(&env, invoice_id)?;
+        let cond = get_oracle_condition(&env, invoice_id).ok_or(Error::NoOracleCondition)?;
+        evaluate_oracle_condition(&env, invoice_id, &cond)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduled release
+    // -----------------------------------------------------------------------
+
+    /// Delay the release of an invoice until a specific time and ledger.
+    ///
+    /// Release (including auto-release on full funding) is blocked until the
+    /// ledger timestamp is `>= release_at` **and** the ledger sequence is
+    /// `>= current_sequence + min_ledgers`. Only the creator may schedule,
+    /// and only while the invoice is open. Calling again replaces any
+    /// existing schedule.
+    ///
+    /// The schedule and invoice TTLs are extended so both entries remain
+    /// live until the schedule is due.
+    ///
+    /// # Arguments
+    /// * `invoice_id`  — Target invoice.
+    /// * `release_at`  — Unix timestamp; must be strictly in the future.
+    /// * `min_ledgers` — Minimum ledgers to wait (≤ `MAX_SCHEDULE_LEDGERS`).
+    ///
+    /// # Events
+    /// Emits `(escrow, sched_set, id)` with `(release_at, unlock_ledger)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]   — Invoice is no longer open.
+    /// * [`Error::InvalidSchedule`] — `release_at` not in the future or
+    ///   `min_ledgers` too large.
+    pub fn schedule_release(
+        env: Env,
+        invoice_id: u64,
+        release_at: u64,
+        min_ledgers: u32,
+    ) -> Result<ReleaseSchedule, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let now = env.ledger().timestamp();
+        let seq = env.ledger().sequence();
+        if release_at <= now || min_ledgers > MAX_SCHEDULE_LEDGERS {
+            return Err(Error::InvalidSchedule);
+        }
+        let unlock_ledger = seq.checked_add(min_ledgers).ok_or(Error::InvalidSchedule)?;
+
+        let schedule = ReleaseSchedule {
+            release_at,
+            unlock_ledger,
+            scheduled_at: now,
+            scheduled_ledger: seq,
+            status: ScheduleStatus::Scheduled,
+        };
+        save_schedule(&env, invoice_id, &schedule);
+        emit_schedule_set(&env, invoice_id, &schedule);
+        Ok(schedule)
+    }
+
+    /// Cancel an active release schedule so it no longer gates release.
+    ///
+    /// Only the creator may cancel, and only while the invoice is open.
+    ///
+    /// # Events
+    /// Emits `(escrow, sched_cnl, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]  — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]    — Invoice is no longer open.
+    /// * [`Error::ScheduleNotFound`] — No active schedule.
+    pub fn cancel_release_schedule(env: Env, invoice_id: u64) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+        let mut schedule = get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .ok_or(Error::ScheduleNotFound)?;
+
+        schedule.status = ScheduleStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&schedule_key(invoice_id), &schedule);
+        emit_schedule_cancelled(&env, invoice_id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Refund grace period
+    // -----------------------------------------------------------------------
+
+    /// Set the default refund grace period applied to invoices created from
+    /// now on. Existing invoices keep the grace period they were created with.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_def)` with `grace_secs`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvalidGracePeriod`] — `grace_secs > MAX_REFUND_GRACE_SECS`.
+    pub fn set_default_refund_grace(env: Env, grace_secs: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        if grace_secs > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+        env.storage().instance().set(&default_grace_key(), &grace_secs);
+        emit_default_grace_set(&env, grace_secs);
+        Ok(())
+    }
+
+    /// Return the default refund grace period (seconds) for new invoices.
+    pub fn get_default_refund_grace(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&default_grace_key())
+            .unwrap_or(0)
+    }
+
+    /// Set an invoice's own refund grace period, overriding the default it
+    /// was created with.
+    ///
+    /// Only the creator may do this, and only while the invoice is still
+    /// `Pending` (no deposits yet), so payers always fund against known
+    /// refund terms. Any admin extension is reset.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_set, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice already has deposits or is closed.
+    /// * [`Error::InvalidGracePeriod`] — `grace_secs > MAX_REFUND_GRACE_SECS`.
+    pub fn set_refund_grace(env: Env, invoice_id: u64, grace_secs: u64) -> Result<(), Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        invoice.creator.require_auth();
+        if invoice.status != EscrowStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if grace_secs > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+
+        let grace = RefundGrace {
+            grace_secs,
+            extension_secs: 0,
+            waived: false,
+        };
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_set"), invoice_id, &grace);
+        Ok(())
+    }
+
+    /// Admin override: extend an invoice's refund grace period.
+    ///
+    /// Allowed while the invoice is open and before the grace period has
+    /// elapsed or been waived. The total grace (base + extensions) may not
+    /// exceed `MAX_REFUND_GRACE_SECS`.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_ext, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice is no longer open.
+    /// * [`Error::InvalidGracePeriod`] — Zero extension or total too long.
+    /// * [`Error::RefundGraceElapsed`] — Grace already elapsed or waived.
+    pub fn extend_refund_grace(env: Env, invoice_id: u64, extra_secs: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let current = get_grace(&env, invoice_id);
+        match grace_status(&env, &invoice, &current) {
+            RefundGraceStatus::Elapsed | RefundGraceStatus::Waived => {
+                return Err(Error::RefundGraceElapsed)
+            }
+            RefundGraceStatus::NoGrace if env.ledger().timestamp() > invoice.deadline => {
+                // No grace and deadline passed: refunds are already open.
+                return Err(Error::RefundGraceElapsed);
+            }
+            _ => {}
+        }
+
+        let mut grace = current.unwrap_or(RefundGrace {
+            grace_secs: 0,
+            extension_secs: 0,
+            waived: false,
+        });
+        let total = grace
+            .grace_secs
+            .checked_add(grace.extension_secs)
+            .and_then(|t| t.checked_add(extra_secs))
+            .ok_or(Error::InvalidGracePeriod)?;
+        if extra_secs == 0 || total > MAX_REFUND_GRACE_SECS {
+            return Err(Error::InvalidGracePeriod);
+        }
+
+        grace.extension_secs += extra_secs;
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_ext"), invoice_id, &grace);
+        Ok(())
+    }
+
+    /// Admin override: waive an invoice's refund grace period so refunds can
+    /// be processed as soon as the deadline has passed.
+    ///
+    /// # Events
+    /// Emits `(escrow, grace_wvd, id)`.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`]     — Contract not initialized.
+    /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
+    /// * [`Error::InvalidStatus`]      — Invoice is no longer open.
+    /// * [`Error::RefundGraceElapsed`] — No grace to waive (none configured,
+    ///   already elapsed, or already waived).
+    pub fn waive_refund_grace(env: Env, invoice_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&admin_key()) {
+            return Err(Error::NotInitialized);
+        }
+        require_admin(&env);
+        let invoice = get_invoice(&env, invoice_id)?;
+        if !is_open(&invoice) {
+            return Err(Error::InvalidStatus);
+        }
+
+        let current = get_grace(&env, invoice_id);
+        match grace_status(&env, &invoice, &current) {
+            RefundGraceStatus::NotStarted | RefundGraceStatus::Active => {}
+            _ => return Err(Error::RefundGraceElapsed),
+        }
+
+        // `grace_status` only reports NotStarted/Active when a record exists.
+        let mut grace = current.unwrap();
+        grace.waived = true;
+        save_grace(&env, invoice_id, &grace);
+        emit_grace_changed(&env, symbol_short!("grace_wvd"), invoice_id, &grace);
         Ok(())
     }
 
@@ -855,6 +1739,109 @@ impl InvoiceEscrowContract {
         env.storage()
             .persistent()
             .get(&blacklist_key(&payer))
+    }
+
+    /// Return the full co-signer approval record for an invoice, if any.
+    pub fn get_approval(env: Env, invoice_id: u64) -> Option<CosignerApproval> {
+        get_approval(&env, invoice_id)
+    }
+
+    /// Return the aggregate co-signer approval status, or `None` when the
+    /// invoice has no co-signer requirement.
+    pub fn get_approval_status(env: Env, invoice_id: u64) -> Option<ApprovalStatus> {
+        get_approval(&env, invoice_id).map(|a| a.status)
+    }
+
+    /// Return `true` if `signer` has approved the invoice's release.
+    pub fn has_approved(env: Env, invoice_id: u64, signer: Address) -> bool {
+        get_approval(&env, invoice_id).map_or(false, |a| a.approvals.contains(&signer))
+    }
+
+    /// Return how many more approvals are needed to reach the threshold
+    /// (`0` when already approved or when no co-signers are configured).
+    pub fn approvals_remaining(env: Env, invoice_id: u64) -> u32 {
+        get_approval(&env, invoice_id).map_or(0, |a| a.threshold.saturating_sub(a.approvals.len()))
+    }
+
+    /// Return the oracle condition attached to an invoice, if any.
+    pub fn get_oracle_condition(env: Env, invoice_id: u64) -> Option<OracleCondition> {
+        get_oracle_condition(&env, invoice_id)
+    }
+
+    /// Return the last oracle reading recorded during a release attempt
+    /// (e.g. a deposit that completed funding), if any.
+    pub fn get_last_oracle_reading(env: Env, invoice_id: u64) -> Option<OracleReading> {
+        env.storage().persistent().get(&oracle_read_key(invoice_id))
+    }
+
+    /// Return the release schedule for an invoice, if any.
+    pub fn get_release_schedule(env: Env, invoice_id: u64) -> Option<ReleaseSchedule> {
+        get_schedule(&env, invoice_id)
+    }
+
+    /// Return `true` when the invoice has no active schedule or its schedule
+    /// is due (both the time and ledger bounds have passed).
+    pub fn is_release_due(env: Env, invoice_id: u64) -> bool {
+        get_schedule(&env, invoice_id).map_or(true, |s| {
+            s.status != ScheduleStatus::Scheduled
+                || (env.ledger().timestamp() >= s.release_at
+                    && env.ledger().sequence() >= s.unlock_ledger)
+        })
+    }
+
+    /// Seconds remaining until the scheduled release time (`0` when due or
+    /// when there is no active schedule).
+    pub fn seconds_until_release(env: Env, invoice_id: u64) -> u64 {
+        get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .map_or(0, |s| s.release_at.saturating_sub(env.ledger().timestamp()))
+    }
+
+    /// Ledgers remaining until the scheduled unlock ledger (`0` when reached
+    /// or when there is no active schedule).
+    pub fn ledgers_until_release(env: Env, invoice_id: u64) -> u32 {
+        get_schedule(&env, invoice_id)
+            .filter(|s| s.status == ScheduleStatus::Scheduled)
+            .map_or(0, |s| s.unlock_ledger.saturating_sub(env.ledger().sequence()))
+    }
+
+    /// Return the refund grace configuration for an invoice, if any.
+    pub fn get_refund_grace(env: Env, invoice_id: u64) -> Option<RefundGrace> {
+        get_grace(&env, invoice_id)
+    }
+
+    /// Return where the invoice is in its refund grace timeline.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn get_refund_grace_status(env: Env, invoice_id: u64) -> Result<RefundGraceStatus, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        Ok(grace_status(&env, &invoice, &get_grace(&env, invoice_id)))
+    }
+
+    /// Return the timestamp after which refunds may be processed (deadline
+    /// plus any un-waived grace period).
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn refund_available_after(env: Env, invoice_id: u64) -> Result<u64, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        Ok(refund_opens_at(&invoice, &get_grace(&env, invoice_id)))
+    }
+
+    /// Seconds left on the refund grace timer.
+    ///
+    /// Before the deadline this is the full grace window; after the deadline
+    /// it counts down to `0`. Always `0` when there is no grace period or it
+    /// has been waived.
+    ///
+    /// # Errors
+    /// * [`Error::InvoiceNotFound`] — Unknown invoice ID.
+    pub fn refund_grace_remaining(env: Env, invoice_id: u64) -> Result<u64, Error> {
+        let invoice = get_invoice(&env, invoice_id)?;
+        let opens_at = refund_opens_at(&invoice, &get_grace(&env, invoice_id));
+        let from = env.ledger().timestamp().max(invoice.deadline);
+        Ok(opens_at.saturating_sub(from))
     }
 
     /// Return `true` if the payer is blacklisted with a finalised and upheld entry.

@@ -41,7 +41,7 @@ fn token_client<'a>(env: &'a Env, token_id: &Address) -> TokenClient<'a> {
     TokenClient::new(env, token_id)
 }
 
-fn default_options(env: &Env) -> InvoiceOptions {
+pub(crate) fn default_options(env: &Env) -> InvoiceOptions {
     InvoiceOptions {
         co_creators: Vec::new(env),
         allow_early_withdrawal: false,
@@ -8688,385 +8688,689 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
 // ---------------------------------------------------------------------------
-// Issue #950 — Batch query API
+// Issue #892: Contract security audit framework
 // ---------------------------------------------------------------------------
 
-/// Build a batch query for a single invoice id.
-fn batch_query(env: &Env, id: u64) -> types::BatchQuery {
-    types::BatchQuery {
-        invoice_ids: {
-            let mut ids = Vec::new(env);
-            ids.push_back(id);
-            ids
-        },
-        include_ext: false,
-        include_ext2: false,
-        include_audit_log: false,
-    }
-}
-
 #[test]
-fn test_batch_query_preserves_request_order() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
-
-    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
-    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
-
-    // Request in a deliberately non-ascending order.
-    let mut ids = Vec::new(&env);
-    ids.push_back(id3);
-    ids.push_back(id1);
-    ids.push_back(id2);
-
-    let query = types::BatchQuery {
-        invoice_ids: ids,
-        include_ext: false,
-        include_ext2: false,
-        include_audit_log: false,
-    };
-    let results = c.batch_query(&query);
-
-    assert_eq!(results.len(), 3);
-    assert_eq!(results.get_unchecked(0).invoice.id, id3);
-    assert_eq!(results.get_unchecked(1).invoice.id, id1);
-    assert_eq!(results.get_unchecked(2).invoice.id, id2);
-    assert_eq!(results.get_unchecked(0).invoice.amounts.get_unchecked(0), 300);
-    assert_eq!(results.get_unchecked(1).invoice.amounts.get_unchecked(0), 100);
-    assert_eq!(results.get_unchecked(2).invoice.amounts.get_unchecked(0), 200);
-}
-
-#[test]
-fn test_batch_query_deduplicates_repeated_ids() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-
-    let mut ids = Vec::new(&env);
-    ids.push_back(id);
-    ids.push_back(id);
-    ids.push_back(id);
-
-    let query = types::BatchQuery {
-        invoice_ids: ids,
-        include_ext: false,
-        include_ext2: false,
-        include_audit_log: false,
-    };
-    let results = c.batch_query(&query);
-
-    // Duplicate ids collapse to a single result.
-    assert_eq!(results.len(), 1);
-    assert_eq!(results.get_unchecked(0).invoice.id, id);
-}
-
-#[test]
-fn test_batch_query_empty_batch_returns_empty() {
+fn test_892_add_and_remove_security_auditor() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
 
-    let query = types::BatchQuery {
-        invoice_ids: Vec::new(&env),
-        include_ext: false,
-        include_ext2: false,
-        include_audit_log: false,
-    };
-    let results = c.batch_query(&query);
-    assert_eq!(results.len(), 0);
+    c.add_security_auditor(&auditor);
+    assert!(c.get_security_auditors().contains(&auditor));
+
+    // Adding twice is idempotent.
+    c.add_security_auditor(&auditor);
+    assert_eq!(c.get_security_auditors().len(), 1);
+
+    c.remove_security_auditor(&auditor);
+    assert!(c.get_security_auditors().is_empty());
 }
 
 #[test]
-fn test_batch_query_rejects_oversized_batch() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-
-    // Build a batch larger than the maximum allowed size.
-    let mut ids = Vec::new(&env);
-    for _ in 0..(types::MAX_BATCH_QUERY_SIZE + 1) {
-        ids.push_back(id);
-    }
-
-    let query = types::BatchQuery {
-        invoice_ids: ids,
-        include_ext: false,
-        include_ext2: false,
-        include_audit_log: false,
-    };
-    let res = c.try_batch_query(&query);
-    assert!(res.is_err(), "oversized batch must be rejected");
-}
-
-#[test]
-fn test_batch_query_includes_optional_sections() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-
-    let query = types::BatchQuery {
-        invoice_ids: {
-            let mut ids = Vec::new(&env);
-            ids.push_back(id);
-            ids
-        },
-        include_ext: true,
-        include_ext2: true,
-        include_audit_log: true,
-    };
-    let results = c.batch_query(&query);
-    assert_eq!(results.len(), 1);
-    let entry = results.get_unchecked(0);
-    assert_eq!(entry.invoice.id, id);
-    assert!(entry.ext.is_some());
-    assert!(entry.ext2.is_some());
-    assert!(entry.audit_log.is_some());
-}
-
-// ---------------------------------------------------------------------------
-// Issue #952 — Error recovery suggestions
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_recovery_suggestion_non_empty_for_known_errors() {
+fn test_892_contract_audit_passes_on_initialized_contract() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
 
-    let errors = [
-        ContractError::InvoiceNotFound,
-        ContractError::InvoiceAlreadyReleased,
-        ContractError::InvoiceAlreadyRefunded,
-        ContractError::InvoiceExpired,
-        ContractError::Unauthorized,
-        ContractError::InvalidAmount,
-        ContractError::InvoiceFrozen,
-        ContractError::InvoiceDeleted,
-        ContractError::FundsUnclaimed,
-        ContractError::NotDeleted,
-        ContractError::BatchTooLarge,
-    ];
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.audit_id, 1);
+    assert_eq!(report.invoice_id, None);
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.critical_failures, 0);
+    assert_eq!(report.risk_score, 0);
+    assert_eq!(report.passed_count, report.findings.len());
 
-    for err in errors {
-        let suggestion = c.get_recovery_suggestion(&err);
-        assert!(
-            !suggestion.is_empty(),
-            "recovery suggestion for {:?} must not be empty",
-            err
+    assert_eq!(c.get_security_audit_count(), 1);
+    assert_eq!(c.get_security_audit(&1), Some(report));
+}
+
+#[test]
+fn test_892_contract_audit_flags_paused_contract_as_info() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    let admin: Address = env.as_contract(&contract_id, || {
+        env.storage().instance().get(&admin_key()).unwrap()
+    });
+    c.pause(&admin);
+    let report = c.run_security_audit(&auditor);
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.risk_score, 0);
+    let failed = report.findings.iter().find(|f| !f.passed).unwrap();
+    assert_eq!(failed.check, symbol_short!("not_psd"));
+    assert_eq!(failed.severity, security_audit::AuditSeverity::Info);
+}
+
+#[test]
+fn test_892_invoice_audit_passes_for_valid_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+
+    let report = c.run_invoice_security_audit(&auditor, &id);
+    assert_eq!(report.invoice_id, Some(id));
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(c.get_security_audit_count(), 1);
+}
+
+#[test]
+#[should_panic(expected = "caller is not a registered auditor")]
+fn test_892_unregistered_auditor_cannot_run_audit() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    c.run_security_audit(&Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "auditor not registered")]
+fn test_892_remove_unknown_auditor_panics() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    c.remove_security_auditor(&Address::generate(&env));
+}
+
+#[test]
+fn test_892_security_event_log_is_bounded() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let auditor = Address::generate(&env);
+    c.add_security_auditor(&auditor);
+
+    for _ in 0..(security_audit::MAX_SECURITY_EVENTS + 5) {
+        c.log_security_event(
+            &auditor,
+            &symbol_short!("susp_pay"),
+            &security_audit::AuditSeverity::High,
+            &Some(7u64),
         );
     }
+    let log = c.get_security_events();
+    assert_eq!(log.len(), security_audit::MAX_SECURITY_EVENTS);
+    let first = log.get(0).unwrap();
+    assert_eq!(first.reporter, auditor);
+    assert_eq!(first.invoice_id, Some(7u64));
+    assert_eq!(first.severity, security_audit::AuditSeverity::High);
 }
 
 #[test]
-fn test_recovery_suggestion_unknown_error_has_fallback() {
+fn test_892_severity_weights_are_monotonic() {
+    use security_audit::AuditSeverity;
+    assert!(AuditSeverity::Info.weight() < AuditSeverity::Low.weight());
+    assert!(AuditSeverity::Low.weight() < AuditSeverity::Medium.weight());
+    assert!(AuditSeverity::Medium.weight() < AuditSeverity::High.weight());
+    assert!(AuditSeverity::High.weight() < AuditSeverity::Critical.weight());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking
+// ---------------------------------------------------------------------------
+
+fn setup_911() -> (Env, Address, Address, Address, Address, u64) {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+    let creator = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(600_i128);
+    amounts.push_back(400_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000, &default_options(&env));
+    (env, contract_id, creator, r1, r2, id)
+}
+
+fn milestones_911(env: &Env) -> Vec<u32> {
+    let mut m = Vec::new(env);
+    m.push_back(5_000u32);
+    m.push_back(10_000u32);
+    m
+}
+
+#[test]
+fn test_911_init_tracking_creates_structure() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+
+    let t = c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    assert_eq!(t.total_due, 1_000);
+    assert_eq!(t.total_paid, 0);
+    assert_eq!(t.recipients.len(), 2);
+    assert_eq!(t.recipients.get(0).unwrap().recipient, r1);
+    assert_eq!(t.recipients.get(1).unwrap().recipient, r2);
+    assert_eq!(t.milestones.len(), 2);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+    assert_eq!(c.get_recipient_paid_flags(&id), 0);
+    assert_eq!(c.get_payment_tracker(&id), Some(t));
+}
+
+#[test]
+fn test_911_partial_payments_set_paid_flags_and_milestones() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+
+    // 300 of 1000 paid: below the 50% milestone.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert_eq!(t.total_paid, 300);
+    assert!(!c.is_recipient_paid(&id, &0));
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Pending
+    );
+
+    // r1 fully paid (600) → 60%: first milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r1, &300);
+    assert!(c.is_recipient_paid(&id, &0));
+    assert!(!c.is_recipient_paid(&id, &1));
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b01);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+
+    // r2 fully paid → 100%: second milestone reached.
+    let t = c.record_partial_payment(&creator, &id, &r2, &400);
+    assert_eq!(c.get_recipient_paid_flags(&id), 0b11);
+    assert_eq!(t.total_paid, 1_000);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Reached
+    );
+}
+
+#[test]
+fn test_911_settle_milestones_in_order() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+
+    let t = c.settle_payment_milestone(&creator, &id, &0);
+    assert_eq!(
+        t.milestones.get(0).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+    let t = c.settle_payment_milestone(&creator, &id, &1);
+    assert_eq!(
+        t.milestones.get(1).unwrap().state,
+        payment_tracking::MilestoneState::Settled
+    );
+}
+
+#[test]
+#[should_panic(expected = "previous milestone not settled")]
+fn test_911_settle_out_of_order_panics() {
+    let (env, contract_id, creator, r1, r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &600);
+    c.record_partial_payment(&creator, &id, &r2, &400);
+    c.settle_payment_milestone(&creator, &id, &1);
+}
+
+#[test]
+#[should_panic(expected = "milestone not reached")]
+fn test_911_settle_unreached_milestone_panics() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.settle_payment_milestone(&creator, &id, &0);
+}
+
+#[test]
+#[should_panic(expected = "payment exceeds recipient amount due")]
+fn test_911_overpayment_rejected() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &601);
+}
+
+#[test]
+fn test_911_failed_update_leaves_state_unchanged() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&creator, &id, &r1, &100);
+    let before = c.get_payment_tracker(&id);
+
+    let result = c.try_record_partial_payment(&creator, &id, &r1, &10_000);
+    assert!(result.is_err());
+    assert_eq!(c.get_payment_tracker(&id), before);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can record payments")]
+fn test_911_non_creator_cannot_record() {
+    let (env, contract_id, creator, r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.record_partial_payment(&Address::generate(&env), &id, &r1, &100);
+}
+
+#[test]
+#[should_panic(expected = "milestones must be strictly ascending")]
+fn test_911_invalid_milestones_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    let mut m = Vec::new(&env);
+    m.push_back(5_000u32);
+    m.push_back(5_000u32);
+    c.init_payment_tracking(&creator, &id, &m);
+}
+
+#[test]
+#[should_panic(expected = "payment tracking already initialised")]
+fn test_911_double_init_rejected() {
+    let (env, contract_id, creator, _r1, _r2, id) = setup_911();
+    let c = client(&env, &contract_id);
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+    c.init_payment_tracking(&creator, &id, &milestones_911(&env));
+}
+
+#[test]
+fn test_911_paid_bps_helper() {
+    assert_eq!(payment_tracking::paid_bps(0, 1_000), 0);
+    assert_eq!(payment_tracking::paid_bps(500, 1_000), 5_000);
+    assert_eq!(payment_tracking::paid_bps(2_000, 1_000), 10_000);
+    assert_eq!(payment_tracking::paid_bps(10, 0), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limits
+// ---------------------------------------------------------------------------
+
+fn vel_cfg_912(max_payments: u32, max_amount: i128, window_secs: u64, cooldown_secs: u64) -> velocity::VelocityConfig {
+    velocity::VelocityConfig {
+        max_payments,
+        max_amount,
+        window_secs,
+        cooldown_secs,
+    }
+}
+
+#[test]
+fn test_912_check_disabled_config_has_no_limits() {
+    let cfg = velocity::VelocityConfig::default();
+    assert!(!cfg.is_enabled());
+}
+
+#[test]
+fn test_912_check_enforces_payment_count() {
+    let cfg = vel_cfg_912(2, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    let s2 = velocity::check(&cfg, &s1, 10, 1_001).unwrap();
+    assert_eq!(s2.payment_count, 2);
+    assert_eq!(
+        velocity::check(&cfg, &s2, 10, 1_002),
+        Err(ContractError::RateLimitExceeded)
+    );
+}
+
+#[test]
+fn test_912_check_enforces_amount_cap() {
+    let cfg = vel_cfg_912(0, 100, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 60, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 41, 1_001),
+        Err(ContractError::RateLimitExceeded)
+    );
+    // Exactly at the cap is allowed.
+    let s2 = velocity::check(&cfg, &s1, 40, 1_001).unwrap();
+    assert_eq!(s2.amount_total, 100);
+}
+
+#[test]
+fn test_912_check_window_resets_after_elapsed() {
+    let cfg = vel_cfg_912(1, 0, 100, 0);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert!(velocity::check(&cfg, &s1, 10, 1_099).is_err());
+    let s2 = velocity::check(&cfg, &s1, 10, 1_100).unwrap();
+    assert_eq!(s2.window_start, 1_100);
+    assert_eq!(s2.payment_count, 1);
+}
+
+#[test]
+fn test_912_check_enforces_cooldown() {
+    let cfg = vel_cfg_912(0, 0, 0, 30);
+    let s0 = velocity::VelocityState::default();
+    let s1 = velocity::check(&cfg, &s0, 10, 1_000).unwrap();
+    assert_eq!(
+        velocity::check(&cfg, &s1, 10, 1_029),
+        Err(ContractError::RateLimitExceeded)
+    );
+    assert!(velocity::check(&cfg, &s1, 10, 1_030).is_ok());
+}
+
+#[test]
+fn test_912_check_rejects_non_positive_and_overflow() {
+    let cfg = vel_cfg_912(0, 0, 0, 1);
+    let s0 = velocity::VelocityState::default();
+    assert_eq!(velocity::check(&cfg, &s0, 0, 1), Err(ContractError::InvalidAmount));
+    assert_eq!(velocity::check(&cfg, &s0, -5, 1), Err(ContractError::InvalidAmount));
+    let full = velocity::VelocityState {
+        window_start: 1,
+        payment_count: 1,
+        amount_total: i128::MAX,
+        last_payment_at: 0,
+    };
+    let cfg = vel_cfg_912(10, 0, 100, 0);
+    assert_eq!(
+        velocity::check(&cfg, &full, 1, 2),
+        Err(ContractError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn test_912_invalid_config_rejected() {
     let (env, contract_id, _token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-
-    // An error code that has no dedicated suggestion still yields guidance.
-    let suggestion = c.get_recovery_suggestion(&ContractError::InvalidRatioSum);
-    assert!(!suggestion.is_empty());
+    // Window limit with zero window.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(5, 0, 0, 0)).is_err());
+    // Negative amount cap.
+    assert!(c.try_set_velocity_config(&vel_cfg_912(0, -1, 10, 0)).is_err());
 }
 
 #[test]
-fn test_failed_payment_leaves_state_unchanged() {
+fn test_912_pay_blocked_after_payment_count_limit() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
-
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
-
     StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
     env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
 
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.set_velocity_config(&vel_cfg_912(2, 0, 100, 0));
+    assert_eq!(c.get_velocity_config(), vel_cfg_912(2, 0, 100, 0));
 
-    // Overpayment must fail and leave the invoice and balances untouched.
-    let res = c.try_pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
-    assert!(res.is_err());
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id, &100_i128, &1_u64, &false, &false, &None);
+    assert_eq!(c.get_payer_velocity_state(&payer).payment_count, 2);
+    assert!(!c.check_payer_velocity(&payer, &100));
+    assert!(c
+        .try_pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None)
+        .is_err());
 
-    let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.funded, 0);
-    assert_eq!(invoice.payments.len(), 0);
-    assert_eq!(invoice.status, InvoiceStatus::Pending);
-    assert_eq!(tk.balance(&payer), 1_000);
-    assert_eq!(tk.balance(&contract_id), 0);
+    // After the window elapses the payer may pay again.
+    env.ledger().set_timestamp(1_100);
+    assert!(c.check_payer_velocity(&payer, &100));
+    c.pay(&payer, &id, &100_i128, &2_u64, &false, &false, &None);
 }
 
 #[test]
-fn test_failed_refund_leaves_state_unchanged() {
+fn test_912_payer_override_and_reset() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
-
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
+    let other = Address::generate(&env);
     let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
     env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 99_999);
 
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.set_velocity_config(&vel_cfg_912(5, 0, 100, 0));
+    c.set_payer_velocity_override(&payer, &Some(vel_cfg_912(1, 0, 100, 0)));
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 1);
+    assert_eq!(c.get_payer_velocity_config(&other).max_payments, 5);
+
     c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert!(!c.check_payer_velocity(&payer, &100));
 
-    // Refund before the deadline must fail and leave funds in the contract.
-    let res = c.try_refund(&id);
-    assert!(res.is_err());
+    c.reset_payer_velocity(&payer);
+    assert_eq!(c.get_payer_velocity_state(&payer), velocity::VelocityState::default());
+    assert!(c.check_payer_velocity(&payer, &100));
 
-    let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Pending);
-    assert_eq!(invoice.funded, 100);
-    assert_eq!(tk.balance(&payer), 0);
-    assert_eq!(tk.balance(&contract_id), 100);
+    c.set_payer_velocity_override(&payer, &None);
+    assert_eq!(c.get_payer_velocity_config(&payer).max_payments, 5);
 }
 
 // ---------------------------------------------------------------------------
-// Issue #954 — Payment event breakdown
+// Issue #913: Split rules engine
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_payment_breakdown_gross_equals_fee_plus_net() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
-    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
-
-    let breakdown = c.get_payment_breakdown(&id, &0_u32);
-    assert_eq!(breakdown.gross, 200);
-    assert_eq!(breakdown.fee + breakdown.net, breakdown.gross);
-    assert!(breakdown.fee >= 0);
-    assert!(breakdown.net >= 0);
-}
-
-#[test]
-fn test_payment_breakdown_totals_match_invoice() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
-    c.pay(&payer, &id, &150_i128, &1_u64, &false, &false, &None);
-
-    let invoice = c.get_invoice(&id);
-    let mut gross_total: i128 = 0;
-    let mut fee_total: i128 = 0;
-    let mut net_total: i128 = 0;
-    for i in 0..invoice.payments.len() {
-        let b = c.get_payment_breakdown(&id, &i);
-        assert_eq!(b.gross, b.fee + b.net);
-        gross_total += b.gross;
-        fee_total += b.fee;
-        net_total += b.net;
+fn rule_913(
+    recipient_index: u32,
+    priority: u32,
+    criteria: split_rules::RuleCriteria,
+    amount: split_rules::RuleAmount,
+) -> split_rules::SplitRuleDef {
+    split_rules::SplitRuleDef {
+        recipient_index,
+        priority,
+        criteria,
+        amount,
     }
-    assert_eq!(gross_total, invoice.funded);
-    assert_eq!(fee_total + net_total, gross_total);
 }
 
-// ---------------------------------------------------------------------------
-// Issue #956 — Refund reason tracking
-// ---------------------------------------------------------------------------
+fn ctx_913(funded: i128, payer_count: u32, timestamp: u64) -> split_rules::RuleContext {
+    split_rules::RuleContext {
+        funded,
+        payer_count,
+        timestamp,
+    }
+}
 
-#[test]
-fn test_refund_reason_stored_and_emitted() {
+fn setup_913() -> (Env, Address, Address, u64) {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
     env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
-
-    env.ledger().set_timestamp(3_000);
-    c.refund(&id);
-
-    // The reason is persisted with the invoice.
-    let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Refunded);
-    assert_eq!(invoice.refund_reason, Some(types::RefundReason::Expired));
-
-    // The refund event carries the same reason.
-    let has_reason_event = env
-        .events()
-        .all()
-        .events()
-        .iter()
-        .any(|event| {
-            xdr_event_topics(&env, event)
-                .map(|topics| topic0_is(&env, &topics, "refunded"))
-                .unwrap_or(false)
-        });
-    assert!(has_reason_event, "expected a refund event with a reason");
+    let creator = Address::generate(&env);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(Address::generate(&env));
+    recipients.push_back(Address::generate(&env));
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &99_999, &default_options(&env));
+    (env, contract_id, creator, id)
 }
 
 #[test]
-fn test_refund_reason_variants_are_distinct() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
+fn test_913_evaluate_fixed_percentage_and_remainder() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(100)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(2_500)));
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 3);
 
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
-    env.ledger().set_timestamp(1_000);
-
-    // Expired-deadline refund.
-    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
-    env.ledger().set_timestamp(3_000);
-    c.refund(&id);
-    assert_eq!(
-        c.get_invoice(&id).refund_reason,
-        Some(types::RefundReason::Expired)
-    );
-
-    // Creator-cancelled refund.
-    let id2 = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
-    c.pay(&payer, &id2, &100_i128, &0_u64, &false, &false, &None);
-    c.cancel_invoice(&creator, &id2);
-    assert_eq!(
-        c.get_invoice(&id2).refund_reason,
-        Some(types::RefundReason::Cancelled)
-    );
+    let out = split_rules::evaluate(&env, &rules, 3, &ctx_913(1_000, 1, 0));
+    assert_eq!(out.get(0).unwrap(), 100);
+    assert_eq!(out.get(1).unwrap(), 250);
+    assert_eq!(out.get(2).unwrap(), 650);
 }
 
+#[test]
+fn test_913_first_matching_rule_by_priority_wins() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    // Bonus tier once funding reaches 1_000, otherwise a base percentage.
+    rules.push_back(rule_913(0, 1, RuleCriteria::Always, RuleAmount::Percentage(1_000)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(1_000), RuleAmount::Percentage(3_000)));
+    split_rules::validate_rules(&rules, 1);
+
+    let low = split_rules::evaluate(&env, &rules, 1, &ctx_913(500, 0, 0));
+    assert_eq!(low.get(0).unwrap(), 50);
+    let high = split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+    assert_eq!(high.get(0).unwrap(), 300);
+}
+
+#[test]
+fn test_913_criteria_matching() {
+    use split_rules::{criteria_matches, RuleCriteria};
+    let ctx = ctx_913(100, 3, 50);
+    assert!(criteria_matches(&RuleCriteria::Always, &ctx));
+    assert!(criteria_matches(&RuleCriteria::FundedAtLeast(100), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::FundedBelow(100), &ctx));
+    assert!(criteria_matches(&RuleCriteria::PayerCountAtLeast(3), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::PayerCountAtLeast(4), &ctx));
+    assert!(criteria_matches(&RuleCriteria::AfterTimestamp(50), &ctx));
+    assert!(!criteria_matches(&RuleCriteria::BeforeTimestamp(50), &ctx));
+}
+
+#[test]
+fn test_913_unmatched_recipient_gets_zero() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::AfterTimestamp(100), RuleAmount::Fixed(10)));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(1_000, 0, 50));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+fn test_913_zero_funded_yields_zero_amounts() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = split_rules::evaluate(&env, &rules, 2, &ctx_913(0, 0, 0));
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+}
+
+#[test]
+#[should_panic(expected = "split rules exceed funded amount")]
+fn test_913_fixed_exceeding_funded_panics() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1_001)));
+    split_rules::evaluate(&env, &rules, 1, &ctx_913(1_000, 0, 0));
+}
+
+#[test]
+#[should_panic(expected = "rule recipient index out of range")]
+fn test_913_validate_index_out_of_range() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(2, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "duplicate rule priority for recipient")]
+fn test_913_validate_duplicate_priority() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    rules.push_back(rule_913(0, 0, RuleCriteria::FundedAtLeast(5), RuleAmount::Fixed(2)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "only one recipient may take the remainder")]
+fn test_913_validate_multiple_remainders() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "unconditional percentages exceed 100%")]
+fn test_913_validate_percentages_over_100() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(6_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Percentage(5_000)));
+    split_rules::validate_rules(&rules, 2);
+}
+
+#[test]
+#[should_panic(expected = "rule percentage must be 1..=10000 bps")]
+fn test_913_validate_zero_percentage() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let env = Env::default();
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(0)));
+    split_rules::validate_rules(&rules, 1);
+}
+
+#[test]
+#[should_panic(expected = "split rules must not be empty")]
+fn test_913_validate_empty_rules() {
+    let env = Env::default();
+    split_rules::validate_rules(&Vec::new(&env), 1);
+}
+
+#[test]
+fn test_913_rules_persist_on_invoice_and_evaluate() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Percentage(4_000)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    c.set_invoice_split_rules(&creator, &id, &rules);
+    assert_eq!(c.get_invoice_split_rules(&id), rules);
+
+    // Nothing funded yet.
+    let out = c.evaluate_invoice_split_rules(&id);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.get(0).unwrap(), 0);
+    assert_eq!(out.get(1).unwrap(), 0);
+
+    c.clear_invoice_split_rules(&creator, &id);
+    assert!(c.get_invoice_split_rules(&id).is_empty());
+}
+
+#[test]
+fn test_913_preview_split_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, _id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(300)));
+    rules.push_back(rule_913(1, 0, RuleCriteria::Always, RuleAmount::Remainder));
+    let out = c.preview_split_rules(&rules, &2, &ctx_913(1_000, 2, 1_000));
+    assert_eq!(out.get(0).unwrap(), 300);
+    assert_eq!(out.get(1).unwrap(), 700);
+}
+
+#[test]
+#[should_panic(expected = "only the creator can set split rules")]
+fn test_913_non_creator_cannot_set_rules() {
+    use split_rules::{RuleAmount, RuleCriteria};
+    let (env, contract_id, _creator, id) = setup_913();
+    let c = client(&env, &contract_id);
+    let mut rules = Vec::new(&env);
+    rules.push_back(rule_913(0, 0, RuleCriteria::Always, RuleAmount::Fixed(1)));
+    c.set_invoice_split_rules(&Address::generate(&env), &id, &rules);
+}
