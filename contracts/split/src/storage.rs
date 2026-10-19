@@ -63,7 +63,6 @@ pub fn invalidate_recipients_cache(env: &Env, invoice_id: u64) {
     let cache_key = RecipientCacheKey { invoice_id };
     env.storage().persistent().remove(&cache_key);
 }
-=======
 
 /// Save an invoice entry and automatically bump its TTL.
 ///
@@ -104,6 +103,76 @@ where
     env.storage()
         .persistent()
         .extend_ttl(&key, MIN_INVOICE_TTL_LEDGERS, MAX_INVOICE_TTL_LEDGERS);
+}
+
+/// Load the invoice hot key once and reuse it for the duration of an invocation.
+///
+/// Issue #941: the hot key is read at most once per call; callers pass the
+/// returned value around instead of re-reading storage on every access.
+pub fn load_invoice_hot_cached<K, V>(env: &Env, key: K) -> Option<V>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + soroban_sdk::TryFromVal<Env, Val>,
+{
+    env.storage().persistent().get(&key)
+}
+
+/// Read all payment shards for an invoice in a single pass.
+///
+/// Issue #945: iterates `0..count` once, validating each index before the
+/// storage read. Returns [`ShardError::ShardIndexOutOfBounds`] if `count`
+/// exceeds [`MAX_PAYMENT_SHARDS`].
+pub fn load_payment_shards<K, V>(
+    env: &Env,
+    key_fn: impl Fn(u32) -> K,
+    count: u32,
+) -> Result<soroban_sdk::Vec<V>, ShardError>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val> + soroban_sdk::TryFromVal<Env, Val>,
+{
+    validate_shard_count(count)?;
+    let mut out = soroban_sdk::Vec::new(env);
+    let mut i = 0u32;
+    while i < count {
+        validate_shard_index(i)?;
+        let key = key_fn(i);
+        if let Some(v) = env.storage().persistent().get::<K, V>(&key) {
+            out.push_back(v);
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Write all payment shards for an invoice in a single pass.
+///
+/// Issue #945: validates the count and every index before writing, so a
+/// partially-invalid batch never mutates storage.
+pub fn save_payment_shards<K, V>(
+    env: &Env,
+    key_fn: impl Fn(u32) -> K,
+    shards: &soroban_sdk::Vec<V>,
+) -> Result<(), ShardError>
+where
+    K: IntoVal<Env, Val> + Clone,
+    V: IntoVal<Env, Val>,
+{
+    let count = shards.len();
+    validate_shard_count(count)?;
+    let mut i = 0u32;
+    while i < count {
+        validate_shard_index(i)?;
+        i += 1;
+    }
+    let mut i = 0u32;
+    while i < count {
+        let key = key_fn(i);
+        let value = shards.get_unchecked(i);
+        save_invoice(env, key, &value);
+        i += 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

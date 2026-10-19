@@ -290,6 +290,51 @@ pub enum CompoundKey {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #945: Payment shard key helpers
+// ---------------------------------------------------------------------------
+
+/// Number of payment shards per invoice.
+///
+/// Shard allocation is deterministic: shard index for a payment is
+/// `payment_index % PAYMENT_SHARD_COUNT`, so a given payment always lands in
+/// the same shard and reads never need to probe more than one shard.
+pub const PAYMENT_SHARD_COUNT: u64 = 8;
+
+/// Returns the [`InvoiceKey::PaymentShard`] key for `(invoice_id, shard)`.
+///
+/// Layout: `PaymentShard(invoice_id, shard)` → `Vec<PaymentRecord>`.
+/// `shard` must be `< PAYMENT_SHARD_COUNT`; callers should derive it via
+/// [`payment_shard_index`] rather than picking a shard directly.
+#[inline]
+pub fn payment_shard_key(invoice_id: u64, shard: u64) -> InvoiceKey {
+    InvoiceKey::PaymentShard(invoice_id, shard)
+}
+
+/// Maps a payment's position within an invoice to its shard index.
+///
+/// Deterministic and allocation-free: `payment_index % PAYMENT_SHARD_COUNT`.
+#[inline]
+pub fn payment_shard_index(payment_index: u64) -> u64 {
+    payment_index % PAYMENT_SHARD_COUNT
+}
+
+/// Convenience: key for the shard that holds `payment_index` of `invoice_id`.
+#[inline]
+pub fn payment_shard_key_for(invoice_id: u64, payment_index: u64) -> InvoiceKey {
+    payment_shard_key(invoice_id, payment_shard_index(payment_index))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #944: Pagination cursor key helper
+// ---------------------------------------------------------------------------
+
+/// Returns the [`InvoiceKey::InvoiceListCursor`] key for `cursor_id`.
+#[inline]
+pub fn invoice_list_cursor_key(cursor_id: u64) -> InvoiceKey {
+    InvoiceKey::InvoiceListCursor(cursor_id)
+}
+
+// ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
 
@@ -445,6 +490,34 @@ mod tests {
         assert_ne!(
             xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, a.clone())),
             xdr_ck(&env, &CompoundKey::UsedSignatureNonce(1, b.clone()))
+        );
+    }
+
+    #[test]
+    fn payment_shard_index_is_deterministic_and_bounded() {
+        for i in 0..(PAYMENT_SHARD_COUNT * 3) {
+            let shard = payment_shard_index(i);
+            assert!(shard < PAYMENT_SHARD_COUNT);
+            assert_eq!(shard, payment_shard_index(i));
+            assert_eq!(shard, i % PAYMENT_SHARD_COUNT);
+        }
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &payment_shard_key_for(7, 3)),
+            xdr_ik(&env, &payment_shard_key(7, 3))
+        );
+    }
+
+    #[test]
+    fn invoice_list_cursor_key_is_distinct() {
+        let env = Env::default();
+        assert_eq!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &InvoiceKey::InvoiceListCursor(5))
+        );
+        assert_ne!(
+            xdr_ik(&env, &invoice_list_cursor_key(5)),
+            xdr_ik(&env, &invoice_list_cursor_key(6))
         );
     }
 
