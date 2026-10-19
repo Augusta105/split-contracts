@@ -2494,6 +2494,8 @@ fn notify_invoice(
     event: Symbol,
     notification_contract: &Option<Address>,
 ) {
+    // Issue #930: fan the event out to registered webhooks.
+    webhooks::dispatch(env, invoice_id, webhooks::event_from_symbol(env, &event));
     if let Some(contract) = notification_contract {
         let args = (invoice_id, event).into_val(env);
         let _: Val = env.invoke_contract(contract, &Symbol::new(env, "notify"), args);
@@ -3782,7 +3784,8 @@ impl SplitContract {
         }
 
         if amount_applied > 0 {
-            invoice.funded += amount_applied;
+            invoice.funded = validation::checked_add_amount(invoice.funded, amount_applied)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             invoice.payments.push_back(types::Payment {
                 payer: payer.clone(),
                 amount: amount_applied,
@@ -6183,14 +6186,6 @@ impl SplitContract {
                 panic_with_error!(env, ContractError::TooFewRecipients);
             }
         }
-        // Issue #483: reject zero or negative amounts at entry point.
-        for amt in amounts.iter() {
-            guard_nonzero_amount(amt).expect("ZeroAmountNotAllowed");
-        }
-        assert!(
-            deadline > env.ledger().timestamp(),
-            "deadline must be in the future"
-        );
         // Issue #430 / #697: creator-defined payment window.
         if let Some(close_at) = payment_close_at {
             assert!(
@@ -6269,11 +6264,6 @@ impl SplitContract {
             );
         }
 
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
-        }
-
-        let _total_amount: i128 = amounts.iter().sum();
 
         // Issue #286: Verify no duplicate recipients
         for i in 0..recipients.len() {
@@ -6726,6 +6716,7 @@ impl SplitContract {
         }
 
         events::invoice_created(env, id, &creator, total, &invoice.cross_chain_ref);
+        webhooks::dispatch(env, id, webhooks::EVENT_CREATED);
         if let Some(ref addr) = invoice.forward_to {
             events::forward_configured(env, id, addr);
         }
@@ -6896,20 +6887,14 @@ impl SplitContract {
         // Pre-validate all invoices before creating any —
         // ensures atomicity: all succeed or none are created.
         for params in params_list.iter() {
-            assert!(
-                params.recipients.len() == params.amounts.len(),
-                "recipients and amounts length mismatch"
-            );
-            assert!(
-                !params.recipients.is_empty(),
-                "must have at least one recipient"
-            );
-            assert!(
-                params.deadline > env.ledger().timestamp(),
-                "deadline must be in the future"
-            );
-            for amt in params.amounts.iter() {
-                assert!(amt > 0, "amounts must be positive");
+            // Issue #931: shared invoice input validation.
+            if let Err(e) = validation::validate_invoice_inputs(
+                &env,
+                &params.recipients,
+                &params.amounts,
+                params.deadline,
+            ) {
+                env.panic_with_error(e);
             }
         }
 
@@ -6999,18 +6984,14 @@ impl SplitContract {
     ) -> u64 {
         creator.require_auth();
 
-        assert!(
-            recipients.len() == amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-        assert!(!recipients.is_empty(), "must have at least one recipient");
+        // Issue #931: shared recipients/amounts validation.
+        if let Err(e) = validation::validate_recipients_and_amounts(&recipients, &amounts) {
+            env.panic_with_error(e);
+        }
         assert!(
             months > 0 && months <= 12,
             "months must be between 1 and 12"
         );
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
-        }
 
         let deadline = env.ledger().timestamp() + 30 * 24 * 60 * 60;
         let id = Self::_create_invoice_inner(
@@ -7622,7 +7603,8 @@ impl SplitContract {
                 .persistent()
                 .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-            invoice.funded += net_paid;
+            invoice.funded = validation::checked_add_amount(invoice.funded, net_paid)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             let cumulative_key = cumulative_contributed_key(invoice_id);
             let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
             env.storage()
@@ -8424,7 +8406,8 @@ impl SplitContract {
 
         // Capture funded total before and after mutation (used for milestone check below).
         let prev_funded = invoice.funded;
-        invoice.funded += credited_amount;
+        invoice.funded = validation::checked_add_amount(invoice.funded, credited_amount)
+            .unwrap_or_else(|e| env.panic_with_error(e));
 
         // Track lifetime contributions separately; never decremented on withdrawal/refund.
         let cumulative_key = cumulative_contributed_key(invoice_id);
@@ -8680,7 +8663,8 @@ impl SplitContract {
             .persistent()
             .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-        invoice.funded += credited_amount;
+        invoice.funded = validation::checked_add_amount(invoice.funded, credited_amount)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let cumulative_key = cumulative_contributed_key(invoice_id);
         let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
         env.storage()
@@ -8787,7 +8771,8 @@ impl SplitContract {
             .persistent()
             .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
 
-        invoice.funded += converted;
+        invoice.funded = validation::checked_add_amount(invoice.funded, converted)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let cumulative_key = cumulative_contributed_key(invoice_id);
         let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
         env.storage()
@@ -8917,7 +8902,8 @@ impl SplitContract {
                 .persistent()
                 .set(&pay_shard_key(p.invoice_id, shard_id), &shard_payments);
 
-            inv.funded += p.amount;
+            inv.funded = validation::checked_add_amount(inv.funded, p.amount)
+                .unwrap_or_else(|e| env.panic_with_error(e));
             let cumulative_key = cumulative_contributed_key(p.invoice_id);
             let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
             env.storage()
@@ -13304,11 +13290,23 @@ impl SplitContract {
         );
         assert!(!invoice.disputed, "invoice is disputed");
         assert!(invoice.creator == caller, "only creator can add recipients");
+        // Issue #932: reject malformed or zero recipient addresses.
+        if let Err(e) = validation::validate_recipient_address(&env, &recipient) {
+            env.panic_with_error(e);
+        }
         assert!(
             invoice.funded == 0,
             "cannot add recipient after payment received"
         );
         assert!(amount > 0, "amount must be positive");
+        // Issue #933: the new recipient must not push the invoice total past
+        // `MAX_INVOICE_TOTAL` (or overflow i128).
+        let new_total = validation::checked_sum_amounts(&invoice.amounts)
+            .and_then(|t| validation::checked_add_amount(t, amount))
+            .unwrap_or_else(|e| env.panic_with_error(e));
+        if new_total > validation::MAX_INVOICE_TOTAL {
+            env.panic_with_error(ContractError::ArithmeticOverflow);
+        }
 
         let token = invoice.tokens.get(0).expect("no token");
 
@@ -13469,13 +13467,9 @@ impl SplitContract {
         token: Address,
     ) -> u32 {
         creator.require_auth();
-        assert!(
-            recipients.len() == amounts.len(),
-            "recipients and amounts length mismatch"
-        );
-        assert!(!recipients.is_empty(), "must have at least one recipient");
-        for amt in amounts.iter() {
-            assert!(amt > 0, "amounts must be positive");
+        // Issue #931: shared recipients/amounts validation.
+        if let Err(e) = validation::validate_recipients_and_amounts(&recipients, &amounts) {
+            env.panic_with_error(e);
         }
 
         let count: u32 = env
@@ -17095,6 +17089,105 @@ fn update_leaderboard(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
 // ---------------------------------------------------------------------------
 #[contractimpl]
 impl SplitContract {
+    // -----------------------------------------------------------------------
+    // Issue #930: Webhook notifications
+    // -----------------------------------------------------------------------
+
+    /// Register a webhook that is notified of invoice lifecycle events.
+    ///
+    /// * `endpoint`   – off-chain URL consumed by relayers (may be empty if `target` is set)
+    /// * `target`     – optional contract implementing `on_webhook(delivery_id, invoice_id, event)`
+    /// * `event_mask` – bitwise OR of `webhooks::EVENT_*` (created=1, paid=2, released=4,
+    ///                  refunded=8, cancelled=16)
+    /// * `invoice_id` – restrict to one invoice, or `None` for all invoices
+    ///
+    /// Returns the new webhook id.
+    pub fn register_webhook(
+        env: Env,
+        owner: Address,
+        endpoint: String,
+        target: Option<Address>,
+        event_mask: u32,
+        invoice_id: Option<u64>,
+    ) -> u64 {
+        require_not_frozen(&env);
+        require_not_paused(&env);
+        if let Some(id) = invoice_id {
+            let _ = load_invoice(&env, id);
+        }
+        webhooks::register(&env, owner, endpoint, target, event_mask, invoice_id)
+    }
+
+    /// Update a webhook's endpoint, target, filter and active flag. Owner only.
+    pub fn update_webhook(
+        env: Env,
+        owner: Address,
+        webhook_id: u64,
+        endpoint: String,
+        target: Option<Address>,
+        event_mask: u32,
+        invoice_id: Option<u64>,
+        active: bool,
+    ) {
+        require_not_frozen(&env);
+        if let Some(id) = invoice_id {
+            let _ = load_invoice(&env, id);
+        }
+        webhooks::update(&env, owner, webhook_id, endpoint, target, event_mask, invoice_id, active);
+    }
+
+    /// Remove a webhook. Owner only.
+    pub fn remove_webhook(env: Env, owner: Address, webhook_id: u64) {
+        webhooks::remove(&env, owner, webhook_id, false);
+    }
+
+    /// Admin: forcibly remove an abusive or broken webhook.
+    pub fn admin_remove_webhook(env: Env, admin: Address, webhook_id: u64) {
+        require_admin_role(&env, &admin, AdminRole::Operator);
+        webhooks::remove(&env, admin, webhook_id, true);
+    }
+
+    /// Return a webhook by id.
+    pub fn get_webhook(env: Env, webhook_id: u64) -> Option<webhooks::Webhook> {
+        webhooks::get_webhook(&env, webhook_id)
+    }
+
+    /// Return all registered webhooks.
+    pub fn list_webhooks(env: Env) -> Vec<webhooks::Webhook> {
+        webhooks::list(&env)
+    }
+
+    /// Return the webhooks owned by `owner`.
+    pub fn list_owner_webhooks(env: Env, owner: Address) -> Vec<webhooks::Webhook> {
+        webhooks::list_by_owner(&env, &owner)
+    }
+
+    /// Return a delivery record by id.
+    pub fn get_webhook_delivery(env: Env, delivery_id: u64) -> Option<webhooks::WebhookDelivery> {
+        webhooks::get_delivery(&env, delivery_id)
+    }
+
+    /// Return the most recent deliveries for a webhook (oldest first).
+    pub fn list_webhook_deliveries(env: Env, webhook_id: u64) -> Vec<webhooks::WebhookDelivery> {
+        webhooks::list_deliveries(&env, webhook_id)
+    }
+
+    /// Retry a pending delivery once its backoff has elapsed. Callable by anyone.
+    pub fn retry_webhook_delivery(env: Env, delivery_id: u64) -> webhooks::DeliveryStatus {
+        require_not_paused(&env);
+        webhooks::retry(&env, delivery_id)
+    }
+
+    /// Report the outcome of an off-chain endpoint delivery. Webhook owner only.
+    pub fn ack_webhook_delivery(
+        env: Env,
+        owner: Address,
+        delivery_id: u64,
+        success: bool,
+    ) -> webhooks::DeliveryStatus {
+        webhooks::ack(&env, owner, delivery_id, success)
+    }
+
     // -----------------------------------------------------------------------
     // Issue #437: Recipient payout delay
     // -----------------------------------------------------------------------
