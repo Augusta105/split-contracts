@@ -335,6 +335,107 @@ fn test_create_invoice_invalid_amount() {
 }
 
 // ---------------------------------------------------------------------------
+// #934: deadline validation boundaries
+// ---------------------------------------------------------------------------
+
+/// Deadline rules enforced by `create_invoice`:
+/// - The deadline must be strictly greater than the current ledger timestamp;
+///   a deadline equal to "now" (or any past timestamp) is rejected with
+///   `Error::DeadlinePassed`.
+/// - The deadline must not exceed `now + MAX_DEADLINE_HORIZON`; anything
+///   beyond that window is rejected with `Error::DeadlineOutOfRange`.
+#[test]
+fn test_create_invoice_deadline_equal_now_rejected() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(1_000);
+
+    // Boundary: deadline == now is not in the future.
+    let result = client.try_create_invoice(&creator, &token, &1_000_000, &1_000u64);
+    assert_eq!(result, Err(Ok(Error::DeadlinePassed)));
+}
+
+#[test]
+fn test_create_invoice_deadline_now_plus_one_accepted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(1_000);
+
+    // Boundary: the smallest valid future deadline.
+    let id = client.create_invoice(&creator, &token, &1_000_000, &1_001u64);
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.deadline, 1_001);
+}
+
+#[test]
+fn test_create_invoice_deadline_at_max_horizon_accepted() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    client.initialize(&admin);
+    let now: u64 = 1_000;
+    env.ledger().set_timestamp(now);
+
+    // Boundary: exactly at the maximum allowed horizon.
+    let deadline = now + InvoiceEscrowContract::MAX_DEADLINE_HORIZON;
+    let id = client.create_invoice(&creator, &token, &1_000_000, &deadline);
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.deadline, deadline);
+}
+
+#[test]
+fn test_create_invoice_deadline_beyond_max_horizon_rejected() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    client.initialize(&admin);
+    let now: u64 = 1_000;
+    env.ledger().set_timestamp(now);
+
+    // Boundary: one second past the maximum allowed horizon.
+    let deadline = now + InvoiceEscrowContract::MAX_DEADLINE_HORIZON + 1;
+    let result = client.try_create_invoice(&creator, &token, &1_000_000, &deadline);
+    assert_eq!(result, Err(Ok(Error::DeadlineOutOfRange)));
+}
+
+#[test]
+fn test_create_invoice_far_past_deadline_rejected() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(1_000_000);
+
+    // A deadline far in the past must be rejected as already passed.
+    let result = client.try_create_invoice(&creator, &token, &1_000_000, &1u64);
+    assert_eq!(result, Err(Ok(Error::DeadlinePassed)));
+}
+
+// ---------------------------------------------------------------------------
 // deposit
 // ---------------------------------------------------------------------------
 

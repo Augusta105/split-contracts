@@ -21,6 +21,7 @@ Full reference for all public entry points in the StellarSplit Soroban contract 
 - [Fee Management](#fee-management)
 - [Analytics](#analytics)
 - [Read Functions](#read-functions)
+- [Validation Rules](#validation-rules)
 
 ---
 
@@ -40,6 +41,8 @@ pub fn initialize(
 ```
 
 One-time setup. Sets the contract admin, USDC token address, treasury, platform fee basis points, and creation fee. Panics if called more than once.
+
+`platform_fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)); `usdc_token` must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)).
 
 ---
 
@@ -196,8 +199,8 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `creator` | `Address` | Invoice creator; must sign the transaction |
 | `recipients` | `Vec<Address>` | Ordered list of recipient addresses |
 | `amounts` | `Vec<i128>` | Amount owed to each recipient in token units; `amounts[i]` → `recipients[i]` |
-| `token` | `Address` | SAC token contract address (typically USDC) |
-| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded |
+| `token` | `Address` | SAC token contract address (typically USDC). Must implement the SEP-41 interface (see [Token Contract Validation](#token-contract-validation)) |
+| `deadline` | `u64` | Unix timestamp after which the invoice can be refunded if unfunded. Must be strictly greater than the current ledger timestamp and no more than `MAX_DEADLINE_HORIZON` seconds ahead (see [Validation Rules](#validation-rules)) |
 | `options` | `InvoiceOptions` | Extended options struct (see below) |
 
 **`InvoiceOptions` fields:**
@@ -231,7 +234,7 @@ Creates a new invoice. Returns the auto-incremented invoice ID.
 | `accepted_tokens` | `Vec<Address>` | Additional tokens accepted in `pay_with_token` |
 | `forward_to` | `Option<Address>` | Auto-forward leftover funds to this address |
 | `forward_invoice_id` | `Option<u64>` | Auto-forward leftover funds to another invoice |
-| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release |
+| `split_rules` | `Vec<SplitRule>` | Per-recipient split rules (`Fixed`, `Percentage`, `Tiered`) evaluated at release. Must be non-empty when provided, each ratio must be in `(0, MAX_RATIO]`, and ratios must sum to exactly `10_000` bps (see [Validation Rules](#validation-rules)) |
 | `auto_resolve_rules` | `Vec<ResolveRule>` | Pre-agreed auto-resolution rules evaluated when `auto_resolve` is called |
 | `oracle_address` | `Option<Address>` | Oracle that must confirm a condition before release |
 | `cross_chain_ref` | `Option<String>` | Cross-chain reference identifier |
@@ -851,7 +854,7 @@ Returns the current creation fee.
 pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>)
 ```
 
-Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers.
+Sets volume-based platform fee tiers. Each `FeeTier` has `{ volume_threshold: u64, fee_bps: u32 }`. Tiers must be sorted by threshold ascending. Max 5 tiers. Each `fee_bps` must not exceed `MAX_PLATFORM_FEE_BPS` (see [Validation Rules](#validation-rules)).
 
 ### `get_fee_tiers`
 

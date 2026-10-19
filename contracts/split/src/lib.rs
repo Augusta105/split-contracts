@@ -6080,6 +6080,10 @@ impl SplitContract {
     ) -> u64 {
         check_not_paused(env);
         validate_allowed_token(env, &funding_token);
+        // Issue #940: verify the funding token implements the SEP-41 interface.
+        if let Err(e) = validation::validate_token_contract(env, &funding_token) {
+            env.panic_with_error(e);
+        }
         assert!(
             recipients.len() == amounts.len(),
             "recipients and amounts length mismatch"
@@ -6140,8 +6144,16 @@ impl SplitContract {
             .instance()
             .get(&platform_fee_bps_key())
             .unwrap_or(0u32);
+        // Issue #935: the stored platform fee must itself be within the cap.
+        if let Err(e) = validation::validate_fee_rate(platform_fee_bps) {
+            env.panic_with_error(e);
+        }
         if early_bird_fee_bps > platform_fee_bps {
             env.panic_with_error(ContractError::InvalidAmount);
+        }
+        // Issue #935: the early-bird fee is a fee rate too — cap it as well.
+        if let Err(e) = validation::validate_fee_rate(early_bird_fee_bps) {
+            env.panic_with_error(e);
         }
         // Issue #559: creator fee must be within bounds and not exceed cap with platform fee.
         assert!(
@@ -6262,32 +6274,12 @@ impl SplitContract {
             );
         }
 
-        // Issue: validate split_rules — must have one rule per recipient, rules must sum to 100%.
+        // Issue #939: validate split_rules — one rule per recipient, each rule
+        // within bounds, and all rules summing to exactly 100% (10 000 bps).
         if !split_rules.is_empty() {
-            assert!(
-                split_rules.len() == recipients.len(),
-                "split_rules length must match recipients"
-            );
-            let total_amounts: i128 = amounts.iter().sum();
-            assert!(total_amounts > 0, "total amounts must be positive");
-            let mut total_bps: u32 = 0;
-            for rule in split_rules.iter() {
-                match rule {
-                    SplitRule::Fixed(amt) => {
-                        total_bps += (amt as u128 * 10_000u128 / total_amounts as u128) as u32;
-                    }
-                    SplitRule::Percentage(bps) => {
-                        total_bps += bps;
-                    }
-                    SplitRule::Tiered(_, bps) => {
-                        total_bps += bps;
-                    }
-                }
+            if let Err(e) = validation::validate_split_rules(&split_rules, amounts.len()) {
+                env.panic_with_error(e);
             }
-            assert!(
-                total_bps == 10_000,
-                "split_rules must sum to 100% of funded amount"
-            );
         }
 
         // Compliance check: if a compliance contract is configured, verify creator and all recipients.
@@ -17361,7 +17353,10 @@ impl SplitContract {
                     env.storage().persistent().set(&paused_key(), &false);
                 }
                 AdminAction::SetPlatformFeeBps(bps) => {
-                    assert!(bps <= 10_000, "fee_bps must be ≤ 10000");
+                    // Issue #935: enforce the platform fee cap before persisting.
+                    if let Err(e) = validation::validate_fee_rate(bps) {
+                        env.panic_with_error(e);
+                    }
                     env.storage()
                         .instance()
                         .set(&platform_fee_bps_key(), &bps);
@@ -17437,6 +17432,11 @@ impl SplitContract {
         let ratio_sum: u32 = ratios.iter().fold(0u32, |a, b| a.saturating_add(b));
         validation::assert_bps_total(ratio_sum)
             .expect("ratios must sum to 10000 basis points");
+
+        // Issue #940: the template token must implement the SEP-41 interface.
+        if let Err(e) = validation::validate_token_contract(&env, &token) {
+            env.panic_with_error(e);
+        }
 
         // Assign the next template ID for this creator.
         let next_id: u64 = env

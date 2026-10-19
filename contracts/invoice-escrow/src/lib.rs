@@ -711,6 +711,9 @@ impl InvoiceEscrowContract {
     /// # Errors
     /// * [`Error::NotInitialized`]   — Contract not initialized.
     /// * [`Error::InvalidTotalAmount`] — `total_amount` ≤ 0.
+    /// * [`Error::DeadlinePassed`]   — `deadline` is not in the future.
+    /// * [`Error::DeadlineOutOfRange`] — `deadline` exceeds the maximum
+    ///   horizon of 365 days from the current ledger timestamp.
     pub fn create_invoice(
         env: Env,
         creator: Address,
@@ -724,6 +727,7 @@ impl InvoiceEscrowContract {
         if total_amount <= 0 {
             return Err(Error::InvalidTotalAmount);
         }
+        validate_deadline(&env, deadline)?;
         creator.require_auth();
 
         let id: u64 = env
