@@ -10,53 +10,41 @@ pub const MIN_INVOICE_TTL_LEDGERS: u32 = 518_400;
 /// Invoices can be bumped multiple times within this window to extend their lifetime.
 pub const MAX_INVOICE_TTL_LEDGERS: u32 = 31_536_000;
 
-/// Issue #947: Number of canonical decimal places used by fixed-point math.
-/// All fixed-point values are represented as integers scaled by `10^CANONICAL_DECIMALS`.
-pub const CANONICAL_DECIMALS: u32 = 7;
+/// Issue #935: Total number of basis points representing 100%.
+///
+/// Basis points (bps) are used for all rate and ratio values in the contract.
+/// One basis point equals 1/100th of a percent (0.01%), so 10_000 bps == 100%.
+/// Any split rule, fee, or ratio expressed in bps must never exceed this value.
+pub const TOTAL_BPS: u32 = 10_000;
 
-/// Issue #947: Fixed-point scale factor (`10^CANONICAL_DECIMALS`).
-/// Multiply a real value by this to obtain its fixed-point integer representation.
-pub const FIXED_POINT_SCALE: i128 = 10_000_000;
+/// Issue #935: Maximum platform fee rate in basis points.
+///
+/// The platform fee is deducted from the invoice total before it is distributed
+/// to split recipients. This cap (1000 bps == 10%) prevents misconfiguration
+/// from silently draining funds from recipients or making invoices uneconomical.
+/// It also bounds the worst-case impact of a compromised or buggy admin config.
+pub const MAX_PLATFORM_FEE_BPS: u32 = 1_000;
 
-/// Issue #947: Fixed-point representation of the value `1.0`.
-/// Equivalent to `FIXED_POINT_SCALE`; provided as a semantic alias for readability.
-pub const FIXED_POINT_ONE: i128 = FIXED_POINT_SCALE;
+/// Issue #935: Minimum platform fee rate in basis points.
+///
+/// A fee of 0 bps is valid (no platform fee). This constant documents the
+/// inclusive lower bound so validation logic can be written symmetrically.
+pub const MIN_PLATFORM_FEE_BPS: u32 = 0;
 
-/// Issue #947: Fixed-point representation of the value `0.5`.
-pub const FIXED_POINT_HALF: i128 = FIXED_POINT_SCALE / 2;
+/// Issue #939: Maximum number of split rules allowed per invoice.
+///
+/// Bounds the amount of work performed during distribution and prevents
+/// unbounded storage growth / iteration costs from misconfigured invoices.
+pub const MAX_SPLIT_RULES: u32 = 32;
 
-/// Issue #947: Fixed-point representation of the value `0.0`.
-pub const FIXED_POINT_ZERO: i128 = 0;
+/// Issue #939: Minimum number of split rules allowed per invoice.
+///
+/// An invoice must have at least one recipient to be distributable.
+pub const MIN_SPLIT_RULES: u32 = 1;
 
-/// Issue #947: Number of fractional bits used by the fixed-point representation.
-/// Derived from `CANONICAL_DECIMALS` for use in shift-based conversions.
-pub const FIXED_POINT_FRACTIONAL_BITS: u32 = 24;
-
-/// Issue #948: Maximum number of incremental state updates batched into a single
-/// ledger operation before a full rewrite is forced. Bounds per-call compute cost.
-pub const MAX_INCREMENTAL_UPDATES_PER_BATCH: u32 = 32;
-
-/// Issue #948: Maximum number of pending incremental deltas retained before
-/// they are compacted into the canonical entry.
-pub const MAX_PENDING_DELTAS: u32 = 128;
-
-/// Issue #949: TTL (in ledgers) applied to hot-tier storage entries.
-/// Short-lived, frequently accessed data that is cheap to recompute.
-pub const HOT_TIER_TTL_LEDGERS: u32 = 17_280;
-
-/// Issue #949: TTL (in ledgers) applied to warm-tier storage entries.
-/// Moderately accessed data retained for a few weeks.
-pub const WARM_TIER_TTL_LEDGERS: u32 = 172_800;
-
-/// Issue #949: TTL (in ledgers) applied to cold-tier storage entries.
-/// Rarely accessed archival data; kept within the invoice TTL bounds.
-pub const COLD_TIER_TTL_LEDGERS: u32 = MIN_INVOICE_TTL_LEDGERS;
-
-/// Issue #949: Access-count threshold above which an entry is promoted to the hot tier.
-pub const HOT_TIER_ACCESS_THRESHOLD: u32 = 16;
-
-/// Issue #949: Access-count threshold above which an entry is promoted to the warm tier.
-pub const WARM_TIER_ACCESS_THRESHOLD: u32 = 4;
-
-/// Issue #949: Number of ledgers of inactivity after which an entry is demoted one tier.
-pub const TIER_DEMOTION_IDLE_LEDGERS: u32 = 51_840;
+/// Issue #939: Maximum ratio value for a single split rule in basis points.
+///
+/// A single rule may allocate up to 100% of the distributable amount.
+/// Combined with the sum check against [`TOTAL_BPS`], this ensures no rule
+/// can exceed the total and that all rules together sum to exactly 100%.
+pub const MAX_RATIO_BPS: u32 = TOTAL_BPS;

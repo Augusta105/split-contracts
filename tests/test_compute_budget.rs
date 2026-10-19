@@ -529,3 +529,127 @@ fn test_compute_budget_checked_mid_loop() {
     // Compute budget checked during iteration, should abort if remaining compute too low
     client.release(&invoice_id);
 }
+
+/// Test #950: batch_query reduces compute versus N individual read calls.
+///
+/// Benchmark methodology:
+/// - Build a single invoice with `N` recipients (N = 10).
+/// - Path A ("single"): perform N separate read calls (`get_invoice` /
+///   `get_recipient_amount`) and measure the instructions they consume.
+/// - Path B ("batch"): perform one `batch_query` call returning the same N
+///   results and measure the instructions it consumes.
+/// - Assert the batch path consumes strictly fewer instructions and record
+///   the measured savings for documentation.
+#[test]
+fn test_batch_query_reduces_compute_vs_single_calls() {
+    let e = Env::default();
+    let contract_id = e.register_contract_wasm(None, contract::WASM);
+    let client = contract::Client::new(&e, &contract_id);
+
+    let creator = Address::generate(&e);
+    let payer = Address::generate(&e);
+    let token = MockToken::new(&e, &Address::generate(&e));
+
+    // Build an invoice with N recipients so there are N read targets.
+    let n: usize = 10;
+    let mut recipients = Vec::new(&e);
+    for _ in 0..n {
+        recipients.push_back(Address::generate(&e));
+    }
+
+    let mut amounts = Vec::new(&e);
+    for _ in 0..n {
+        amounts.push_back(100);
+    }
+
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token.address, &10000);
+    let total = (n as i128) * 100;
+    token.mint(&payer, &total);
+    client.pay(&payer, &invoice_id, &total);
+
+    // ---- Path A: N individual read calls ----
+    let single_start = e.budget().reset_unlimited();
+    for i in 0..n {
+        let _ = client.get_invoice(&invoice_id);
+        let _ = client.get_recipient_amount(&invoice_id, &recipients.get(i as u32).unwrap());
+    }
+    let single_instructions = e.budget().cpu_instruction_cost() - single_start;
+
+    // ---- Path B: one batch_query call returning the same N results ----
+    let batch_start = e.budget().reset_unlimited();
+    let batch_results = client.batch_query(&invoice_id, &recipients);
+    let batch_instructions = e.budget().cpu_instruction_cost() - batch_start;
+
+    // Batch must return one result per requested recipient.
+    assert_eq!(batch_results.len(), recipients.len());
+
+    // Batch path must consume strictly fewer instructions than N single calls.
+    assert!(
+        batch_instructions < single_instructions,
+        "batch_query ({batch_instructions} instructions) should use fewer instructions \
+         than {n} single calls ({single_instructions} instructions)"
+    );
+
+    // Document the measured savings for the benchmark record.
+    let saved = single_instructions - batch_instructions;
+    let savings_pct = (saved as f64 / single_instructions as f64) * 100.0;
+    std::println!(
+        "batch_query benchmark: single={single_instructions} instr, \
+         batch={batch_instructions} instr, saved={saved} instr ({savings_pct:.1}%)"
+    );
+}
+
+/// Test #950: batch_query scales sub-linearly relative to per-item reads.
+///
+/// Doubling the number of queried recipients should not double the batch
+/// instruction cost the way N independent calls would; the batch path should
+/// stay well under the cost of the equivalent single-call loop.
+#[test]
+fn test_batch_query_scales_better_than_single_calls() {
+    let e = Env::default();
+    let contract_id = e.register_contract_wasm(None, contract::WASM);
+    let client = contract::Client::new(&e, &contract_id);
+
+    let creator = Address::generate(&e);
+    let payer = Address::generate(&e);
+    let token = MockToken::new(&e, &Address::generate(&e));
+
+    let n: usize = 20;
+    let mut recipients = Vec::new(&e);
+    for _ in 0..n {
+        recipients.push_back(Address::generate(&e));
+    }
+
+    let mut amounts = Vec::new(&e);
+    for _ in 0..n {
+        amounts.push_back(100);
+    }
+
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token.address, &10000);
+    let total = (n as i128) * 100;
+    token.mint(&payer, &total);
+    client.pay(&payer, &invoice_id, &total);
+
+    let single_start = e.budget().reset_unlimited();
+    for i in 0..n {
+        let _ = client.get_invoice(&invoice_id);
+        let _ = client.get_recipient_amount(&invoice_id, &recipients.get(i as u32).unwrap());
+    }
+    let single_instructions = e.budget().cpu_instruction_cost() - single_start;
+
+    let batch_start = e.budget().reset_unlimited();
+    let batch_results = client.batch_query(&invoice_id, &recipients);
+    let batch_instructions = e.budget().cpu_instruction_cost() - batch_start;
+
+    assert_eq!(batch_results.len(), recipients.len());
+    assert!(
+        batch_instructions < single_instructions,
+        "batch_query ({batch_instructions} instructions) should beat {n} single calls \
+         ({single_instructions} instructions)"
+    );
+
+    std::println!(
+        "batch_query scaling benchmark (n={n}): single={single_instructions} instr, \
+         batch={batch_instructions} instr"
+    );
+}

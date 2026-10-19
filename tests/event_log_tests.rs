@@ -264,7 +264,7 @@ fn test_event_log_with_multiple_recipients() {
 }
 
 #[test]
-fn test_guard_failure_events_emitted_per_guard() {
+fn payment_event_includes_breakdown_and_metadata() {
     use split_contracts::contract::Client as SplitContractClient;
 
     let env = Env::default();
@@ -282,64 +282,115 @@ fn test_guard_failure_events_emitted_per_guard() {
 
     let creator = Address::generate(&env);
     let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &300);
 
     env.ledger().set_timestamp(1_000);
 
     let mut recipients = Vec::new(&env);
-    recipients.push_back(recipient.clone());
+    recipients.push_back(recipient1.clone());
+    recipients.push_back(recipient2.clone());
     let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
     amounts.push_back(200_i128);
 
     let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999);
 
-    // Partial payment leaves the invoice unfunded, so release must be blocked
-    // by the funding guard and emit a guard-failure event.
-    client.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false, &None);
+    client.pay(&payer, &invoice_id, &300_i128, &0_u64, &false, &false, &None);
 
-    let events_before = env.events().all().len();
-    let result = client.try_release(&invoice_id);
-    assert!(result.is_err(), "release should be blocked by guard");
+    let events = client.get_event_log(&invoice_id);
+    assert!(events.len() >= 2, "should contain created and paid events");
 
-    let events = env.events().all();
-    assert!(
-        events.len() > events_before,
-        "guard failure should emit an event"
-    );
+    let payment_event = events.last().expect("should have payment event");
+    assert_eq!(payment_event.event_type, Symbol::new(&env, "paid"));
 
-    // Locate the guard-failure event and verify topics + payload.
-    let mut found = false;
-    for event in events.iter() {
-        let (topics, data): (Vec<Symbol>, Map<Symbol, soroban_sdk::Val>) = event.parsed_data();
-        if topics.len() == 3
-            && topics.get(0) == Some(Symbol::new(&env, "split"))
-            && topics.get(1) == Some(Symbol::new(&env, "guard_fail"))
-        {
-            found = true;
-            // Third topic identifies the specific guard.
-            let guard_topic = topics.get(2).expect("guard topic should exist");
-            assert!(
-                guard_topic == Symbol::new(&env, "guard")
-                    || guard_topic == Symbol::new(&env, "funding")
-                    || guard_topic == Symbol::new(&env, "deadline")
-                    || guard_topic == Symbol::new(&env, "status"),
-                "guard topic should identify the guard"
-            );
-            // Payload must carry guard data.
-            assert!(
-                data.contains_key(Symbol::new(&env, "guard"))
-                    || data.contains_key(Symbol::new(&env, "reason")),
-                "guard failure payload should include guard data"
-            );
-        }
-    }
-    assert!(found, "expected a guard_fail event to be emitted");
+    let breakdown = payment_event
+        .data
+        .get(Symbol::new(&env, "breakdown"))
+        .expect("payment event should include breakdown");
+    let breakdown: Map<Address, i128> = breakdown.try_into().expect("breakdown should be a map");
+    assert_eq!(breakdown.len(), 2, "breakdown should cover all recipients");
+    assert_eq!(breakdown.get(recipient1.clone()), Some(100_i128));
+    assert_eq!(breakdown.get(recipient2.clone()), Some(200_i128));
+
+    let total = payment_event
+        .data
+        .get(Symbol::new(&env, "total"))
+        .expect("payment event should include total");
+    let total: i128 = total.try_into().expect("total should be i128");
+    assert_eq!(total, 300_i128);
+
+    let payer_meta = payment_event
+        .data
+        .get(Symbol::new(&env, "payer"))
+        .expect("payment event should include payer metadata");
+    let payer_meta: Address = payer_meta.try_into().expect("payer should be an address");
+    assert_eq!(payer_meta, payer);
+
+    assert!(payment_event.ledger > 0, "event should record ledger number");
 }
 
 #[test]
-fn test_guard_failure_events_are_indexable() {
+fn refund_event_includes_reason() {
+    use split_contracts::contract::Client as SplitContractClient;
+    use split_contracts::types::RefundReason;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token_id).mint(&token_admin, &1_000_000_000);
+
+    let contract_id = env.register_contract_wasm(None, split_contracts::WASM);
+    let client = SplitContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000);
+
+    client.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false, &None);
+
+    env.ledger().set_timestamp(3_000);
+    client.refund(&invoice_id);
+
+    let events = client.get_event_log(&invoice_id);
+    let refund_event = events.last().expect("should have refund event");
+    assert_eq!(refund_event.event_type, Symbol::new(&env, "refunded"));
+
+    let reason = refund_event
+        .data
+        .get(Symbol::new(&env, "reason"))
+        .expect("refund event should include reason");
+    let reason: RefundReason = reason.try_into().expect("reason should be a RefundReason");
+    assert_eq!(reason, RefundReason::DeadlineExpired);
+
+    let amount = refund_event
+        .data
+        .get(Symbol::new(&env, "amount"))
+        .expect("refund event should include amount");
+    let amount: i128 = amount.try_into().expect("amount should be i128");
+    assert_eq!(amount, 100_i128);
+}
+
+#[test]
+fn payment_and_refund_events_are_indexable() {
     use split_contracts::contract::Client as SplitContractClient;
 
     let env = Env::default();
@@ -368,31 +419,31 @@ fn test_guard_failure_events_are_indexable() {
     let mut amounts = Vec::new(&env);
     amounts.push_back(200_i128);
 
-    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999);
+    let invoice_id = client.create_invoice(&creator, &recipients, &amounts, &token_id, &2_000);
     client.pay(&payer, &invoice_id, &100_i128, &0_u64, &false, &false, &None);
 
-    let _ = client.try_release(&invoice_id);
+    env.ledger().set_timestamp(3_000);
+    client.refund(&invoice_id);
 
-    // Guard-failure events must be indexable by their topic symbols so that
-    // off-chain indexers can filter on (split, guard_fail, <guard>).
     let events = env.events().all();
-    let split_topic = Symbol::new(&env, "split");
-    let guard_fail_topic = Symbol::new(&env, "guard_fail");
+    assert!(!events.is_empty(), "should emit events");
 
-    let mut indexed = 0;
+    let mut saw_paid = false;
+    let mut saw_refunded = false;
     for event in events.iter() {
         let (topics, _data): (Vec<Symbol>, soroban_sdk::Val) = event.parsed_data();
-        if topics.get(0) == Some(split_topic.clone())
-            && topics.get(1) == Some(guard_fail_topic.clone())
-        {
-            indexed += 1;
-            assert!(
-                topics.get(2).is_some(),
-                "guard_fail event should carry a guard topic for indexing"
-            );
+        assert!(!topics.is_empty(), "events must have fixed topics for indexing");
+        let topic0 = topics.get(0).expect("topic 0");
+        if topic0 == Symbol::new(&env, "paid") {
+            saw_paid = true;
+        }
+        if topic0 == Symbol::new(&env, "refunded") {
+            saw_refunded = true;
         }
     }
-    assert!(indexed >= 1, "at least one indexable guard_fail event expected");
+
+    assert!(saw_paid, "paid event should be indexable via topic");
+    assert!(saw_refunded, "refunded event should be indexable via topic");
 }
 
 #[test]

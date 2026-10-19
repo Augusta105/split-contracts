@@ -27,7 +27,57 @@
 
 use crate::storage_keys::ev_seq_key;
 use crate::types::{DisputeOutcome, FeeSplit, InvoicePhase, InvoiceStatus, OverfundingPolicy, RepScore, TimelockAction};
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
+
+// ---------------------------------------------------------------------------
+// Payment event details (issue #954)
+// ---------------------------------------------------------------------------
+
+/// Per-recipient breakdown of a payment, included in payment events so
+/// indexers can attribute gross/fee/net amounts without re-deriving them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentBreakdown {
+    pub recipient: Address,
+    pub gross: i128,
+    pub fee: i128,
+    pub net: i128,
+}
+
+/// Metadata carried alongside a payment event's breakdown.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentEventMetadata {
+    pub invoice_id: u64,
+    pub payer: Address,
+    pub timestamp: u64,
+    pub total: i128,
+}
+
+/// Full payload emitted for payment events: metadata plus the per-recipient
+/// breakdown.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentEvent {
+    pub metadata: PaymentEventMetadata,
+    pub breakdown: Vec<PaymentBreakdown>,
+}
+
+// ---------------------------------------------------------------------------
+// Refund reason tracking (issue #956)
+// ---------------------------------------------------------------------------
+
+/// Reason a refund was issued, emitted with refund events so indexers can
+/// categorise refunds without inspecting contract state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefundReason {
+    Expired,
+    Cancelled,
+    Dispute,
+    AdminOverride,
+    Overpayment,
+}
 
 // ---------------------------------------------------------------------------
 // Event sequence helper (per-invoice, temporary-storage counter)
@@ -86,6 +136,31 @@ pub fn payment_received(env: &Env, invoice_id: u64, payer: &Address, amount: i12
     env.events().publish(
         (symbol_short!("split"), symbol_short!("paid"), invoice_id),
         (payer.clone(), amount, token.clone(), event_seq),
+    );
+}
+
+/// Issue #954: Emitted when a payment is received, carrying the full
+/// per-recipient breakdown plus metadata.
+/// Topics: (split, pay_dtl, invoice_id)
+/// Data: PaymentEvent { metadata, breakdown }
+pub fn payment_received_detailed(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    total: i128,
+    breakdown: &Vec<PaymentBreakdown>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pay_dtl"), invoice_id),
+        PaymentEvent {
+            metadata: PaymentEventMetadata {
+                invoice_id,
+                payer: payer.clone(),
+                timestamp: env.ledger().timestamp(),
+                total,
+            },
+            breakdown: breakdown.clone(),
+        },
     );
 }
 
@@ -158,6 +233,26 @@ pub fn invoice_refunded(env: &Env, invoice_id: u64, amount: i128) {
             invoice_id,
         ),
         (invoice_id, amount, event_seq),
+    );
+}
+
+/// Issue #956: Emitted when an invoice is refunded, carrying the reason.
+/// Topics: (split, refunded, invoice_id)
+/// Data: (invoice_id, amount, reason, event_seq)
+pub fn invoice_refunded_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    amount: i128,
+    reason: &RefundReason,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("refunded"),
+            invoice_id,
+        ),
+        (invoice_id, amount, *reason, event_seq),
     );
 }
 
@@ -362,6 +457,86 @@ pub fn invoice_cloned(env: &Env, source_id: u64, new_id: u64) {
     env.events().publish(
         (symbol_short!("cloned"), source_id, new_id),
         (env.ledger().sequence(),),
+    );
+}
+
+/// Issue #926: Emitted when an invoice is partially cloned.
+/// Topics: (split, part_cln, source_id)
+/// Data: (new_id, recipient_count)
+pub fn invoice_partially_cloned(env: &Env, source_id: u64, new_id: u64, recipient_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("part_cln"), source_id),
+        (new_id, recipient_count),
+    );
+}
+
+/// Issue #927: Emitted when an archived invoice is restored.
+/// Topics: (split, restored, invoice_id)
+/// Data: (caller, ledger)
+pub fn invoice_restored(env: &Env, invoice_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("restored"), invoice_id),
+        (caller.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #927: Emitted when an archived invoice is purged by the cleanup policy.
+/// Topics: (split, arch_purg, invoice_id)
+/// Data: ledger
+pub fn invoice_archive_purged(env: &Env, invoice_id: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_purg"), invoice_id),
+        env.ledger().sequence(),
+    );
+}
+
+/// Issue #927: Emitted at the end of a scheduled archival sweep.
+/// Topics: (split, arch_swp)
+/// Data: (archived_count, cursor)
+pub fn archival_sweep_completed(env: &Env, archived_count: u32, cursor: u64) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_swp")),
+        (archived_count, cursor),
+    );
+}
+
+/// Issue #927: Emitted when the archival policy changes.
+/// Topics: (split, arch_pol, admin)
+/// Data: (enabled, retention_ledgers)
+pub fn archival_policy_updated(env: &Env, admin: &Address, enabled: bool, retention_ledgers: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("arch_pol"), admin.clone()),
+        (enabled, retention_ledgers),
+    );
+}
+
+/// Issue #928: Emitted on every recipient authentication state change.
+/// Topics: (split, rcp_auth, invoice_id)
+/// Data: (recipient, action, ledger)
+pub fn recipient_auth_changed(env: &Env, invoice_id: u64, recipient: &Address, action: soroban_sdk::Symbol) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rcp_auth"), invoice_id),
+        (recipient.clone(), action, env.ledger().sequence()),
+    );
+}
+
+/// Issue #929: Emitted when a reversible operation is recorded.
+/// Topics: (split, rv_rec, invoice_id)
+/// Data: (op_id, kind)
+pub fn reversible_op_recorded(env: &Env, invoice_id: u64, op_id: u64, kind: crate::types::ReversibleOpKind) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_rec"), invoice_id),
+        (op_id, kind),
+    );
+}
+
+/// Issue #929: Emitted when a reversible operation is undone.
+/// Topics: (split, rv_undo, invoice_id)
+/// Data: (op_id, caller, ledger)
+pub fn reversible_op_undone(env: &Env, invoice_id: u64, op_id: u64, caller: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("rv_undo"), invoice_id),
+        (op_id, caller.clone(), env.ledger().sequence()),
     );
 }
 
@@ -597,6 +772,88 @@ pub fn circuit_breaker_deactivated(env: &Env) {
         .publish((symbol_short!("split"), symbol_short!("cb_dact")), ());
 }
 
+/// Issue #925: Emitted when a payment batch is opened.
+/// Topics: (split, pb_open, payer)
+/// Data: (batch_id, token)
+pub fn payment_batch_opened(env: &Env, batch_id: u64, payer: &Address, token: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_open"), payer.clone()),
+        (batch_id, token.clone()),
+    );
+}
+
+/// Issue #925: Emitted when a payment batch is executed.
+/// Topics: (split, pb_exec, payer)
+/// Data: (batch_id, item_count, total_amount, savings_bps)
+pub fn payment_batch_executed(
+    env: &Env,
+    batch_id: u64,
+    payer: &Address,
+    item_count: u32,
+    total_amount: i128,
+    savings_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_exec"), payer.clone()),
+        (batch_id, item_count, total_amount, savings_bps),
+    );
+}
+
+/// Issue #925: Emitted when a payment batch is cancelled.
+/// Topics: (split, pb_cncl, payer)
+/// Data: batch_id
+pub fn payment_batch_cancelled(env: &Env, batch_id: u64, payer: &Address) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pb_cncl"), payer.clone()),
+        batch_id,
+    );
+}
+
+/// Issue #923: Emitted on every circuit breaker state transition.
+/// Topics: (split, cb_state)
+/// Data: (from, to, actor, reason, ledger)
+pub fn circuit_breaker_state_changed(
+    env: &Env,
+    from: CircuitBreakerState,
+    to: CircuitBreakerState,
+    actor: &Address,
+    reason: &String,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_state")),
+        (from, to, actor.clone(), reason.clone(), env.ledger().sequence()),
+    );
+}
+
+/// Issue #923: Emitted when a failure is reported against the circuit breaker.
+/// Topics: (split, cb_fail, reporter)
+/// Data: (failure_count, failure_threshold)
+pub fn circuit_breaker_failure_reported(
+    env: &Env,
+    reporter: &Address,
+    failure_count: u32,
+    failure_threshold: u32,
+) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("cb_fail"),
+            reporter.clone(),
+        ),
+        (failure_count, failure_threshold),
+    );
+}
+
+/// Issue #923: Emitted when an operation is added to or removed from the exemption list.
+/// Topics: (split, cb_exmpt)
+/// Data: (function, exempt)
+pub fn circuit_breaker_exemption_set(env: &Env, function: &Symbol, exempt: bool) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cb_exmpt")),
+        (function.clone(), exempt),
+    );
+}
+
 /// Issue #296: Emitted when a fee waiver is granted to a creator.
 /// Topics: (split, fw_grant, creator)
 /// Data: ()
@@ -622,6 +879,34 @@ pub fn fee_waiver_revoked(env: &Env, creator: &Address) {
             creator.clone(),
         ),
         (),
+    );
+}
+
+/// Issue #922: Emitted when a fee waiver's expiry is set or extended.
+/// Topics: (split, fw_exp, creator)
+/// Data: expires_at (0 = never)
+pub fn fee_waiver_expiry_set(env: &Env, creator: &Address, expires_at: u64) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("fw_exp"),
+            creator.clone(),
+        ),
+        expires_at,
+    );
+}
+
+/// Issue #922: Emitted when an expired fee waiver is purged from the whitelist.
+/// Topics: (split, fw_purge, creator)
+/// Data: expires_at
+pub fn fee_waiver_expired(env: &Env, creator: &Address, expires_at: u64) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            symbol_short!("fw_purge"),
+            creator.clone(),
+        ),
+        expires_at,
     );
 }
 
@@ -772,6 +1057,23 @@ pub fn refund_claimed(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
     env.events().publish(
         (symbol_short!("split"), symbol_short!("ref_clm"), invoice_id),
         (payer.clone(), amount),
+    );
+}
+
+/// Issue #956: Emitted when a payer claims their per-payer refund, carrying
+/// the reason the refund was issued.
+/// Topics: (split, ref_clm, invoice_id)
+/// Data: (payer, amount, reason)
+pub fn refund_claimed_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    amount: i128,
+    reason: &RefundReason,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ref_clm"), invoice_id),
+        (payer.clone(), amount, *reason),
     );
 }
 
@@ -1434,6 +1736,26 @@ pub fn refund_issued(env: &Env, invoice_id: u64, payer: &Address, refund_amount:
     );
 }
 
+/// Issue #956: Emitted when a partial refund is issued, carrying the reason.
+/// Topics: (split, RefundIssued, invoice_id)
+/// Data: (payer, refund_amount, reason)
+pub fn refund_issued_with_reason(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    refund_amount: i128,
+    reason: &RefundReason,
+) {
+    env.events().publish(
+        (
+            symbol_short!("split"),
+            soroban_sdk::Symbol::new(env, "RefundIssued"),
+            invoice_id,
+        ),
+        (payer.clone(), refund_amount, *reason),
+    );
+}
+
 /// Issue #471: Emitted when a recipient rotates their payout address.
 /// Topics: (split, RecipientAddressRotated, invoice_id)
 /// Data: (old_address, new_address)
@@ -1915,94 +2237,287 @@ pub fn deadline_extended(env: &Env, invoice_id: u64, old_deadline: u64, new_dead
 }
 
 // ---------------------------------------------------------------------------
-// Issue #957 — Guard failure events
+// Issue #892: Security audit framework events
 // ---------------------------------------------------------------------------
 
-/// Emitted whenever a release guard prevents an operation from proceeding.
-///
-/// # Indexer Guide
-/// Filter events with topic[1] == "guard_fail" to observe every blocked
-/// operation. The specific guard is carried in topic[2] as a short `Symbol`
-/// (see [`guard_names`] for the canonical set), so indexers can narrow to a
-/// single guard by matching that topic. The data payload is a
-/// [`GuardFailure`] struct carrying:
-///   - `guard`: the guard identifier (redundant with topic[2], included so the
-///     event can be decoded from data alone).
-///   - `invoice_id`: the invoice the guard applied to (`0` for contract-level
-///     guards that are not scoped to an invoice).
-///   - `actor`: the address whose operation was blocked.
-///   - `ledger`: the ledger sequence at which the guard fired.
-///   - `detail`: a short human-readable reason / offending value.
-///
-/// Topics: (split, guard_fail, guard)
-/// Data: GuardFailure { guard, invoice_id, actor, ledger, detail }
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GuardFailure {
-    pub guard: soroban_sdk::Symbol,
-    pub invoice_id: u64,
-    pub actor: Address,
-    pub ledger: u32,
-    pub detail: String,
-}
-
-/// Emit a structured guard-failure event.
-///
-/// `guard` identifies which release guard blocked the operation; `invoice_id`
-/// is the affected invoice (`0` when the guard is contract-level); `actor` is
-/// the address whose operation was rejected; `detail` is a short reason.
-pub fn guard_failed(
-    env: &Env,
-    guard: &soroban_sdk::Symbol,
-    invoice_id: u64,
-    actor: &Address,
-    detail: &String,
-) {
+/// Emitted when an auditor is registered (`added = true`) or removed.
+/// Topics: (split, sec_adtr)
+/// Data: (auditor, added)
+pub fn security_auditor_updated(env: &Env, auditor: &Address, added: bool) {
     env.events().publish(
-        (
-            symbol_short!("split"),
-            symbol_short!("guard_fail"),
-            guard.clone(),
-        ),
-        GuardFailure {
-            guard: guard.clone(),
-            invoice_id,
-            actor: actor.clone(),
-            ledger: env.ledger().sequence(),
-            detail: detail.clone(),
-        },
+        (symbol_short!("split"), symbol_short!("sec_adtr")),
+        (auditor.clone(), added),
     );
 }
 
-/// Canonical guard identifiers emitted by [`guard_failed`].
-///
-/// Indexers can use this list to enumerate the guards they may observe in the
-/// `guard_fail` event's topic[2] / `GuardFailure::guard` field.
-pub fn guard_names(env: &Env) -> Vec<soroban_sdk::Symbol> {
-    Vec::from_array(
-        env,
-        [
-            symbol_short!("paused"),
-            symbol_short!("frozen"),
-            symbol_short!("expired"),
-            symbol_short!("deadline"),
-            symbol_short!("not_rdy"),
-            symbol_short!("cosigner"),
-            symbol_short!("cond"),
-            symbol_short!("allowlst"),
-            symbol_short!("nft_gate"),
-            symbol_short!("cap"),
-            symbol_short!("cooldown"),
-            symbol_short!("disputed"),
-            symbol_short!("phase"),
-            symbol_short!("timelock"),
-        ],
-    )
+/// Emitted when a security audit run completes.
+/// Topics: (split, sec_aud, audit_id)
+/// Data: (auditor, invoice_id, failed_count, risk_score, ledger)
+pub fn security_audit_completed(
+    env: &Env,
+    audit_id: u64,
+    auditor: &Address,
+    invoice_id: Option<u64>,
+    failed_count: u32,
+    risk_score: u32,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_aud"), audit_id),
+        (
+            auditor.clone(),
+            invoice_id,
+            failed_count,
+            risk_score,
+            env.ledger().sequence(),
+        ),
+    );
+}
+
+/// Emitted when an auditor logs a security event.
+/// Topics: (split, sec_evt, kind)
+/// Data: (reporter, severity, invoice_id, timestamp)
+pub fn security_event_logged(
+    env: &Env,
+    reporter: &Address,
+    kind: &Symbol,
+    severity: u32,
+    invoice_id: Option<u64>,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sec_evt"), kind.clone()),
+        (
+            reporter.clone(),
+            severity,
+            invoice_id,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #911: Partial invoice payment tracking events
+// ---------------------------------------------------------------------------
+
+/// Emitted when partial payment tracking is initialised for an invoice.
+/// Topics: (split, pt_init, invoice_id)
+/// Data: (total_due, milestone_count, event_seq)
+pub fn payment_tracking_initialised(env: &Env, invoice_id: u64, total_due: i128, milestone_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_init"), invoice_id),
+        (total_due, milestone_count, event_seq),
+    );
+}
+
+/// Emitted when a partial payment to a recipient is recorded.
+/// Topics: (split, pt_pay, invoice_id)
+/// Data: (recipient, amount, total_paid_to_recipient, fully_paid, event_seq)
+pub fn partial_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    recipient: &Address,
+    amount: i128,
+    recipient_paid: i128,
+    fully_paid: bool,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_pay"), invoice_id),
+        (recipient.clone(), amount, recipient_paid, fully_paid, event_seq),
+    );
+}
+
+/// Emitted when a payment milestone changes state (1 = Reached, 2 = Settled).
+/// Topics: (split, pt_mile, invoice_id)
+/// Data: (threshold_bps, state, event_seq)
+pub fn payment_milestone_state(env: &Env, invoice_id: u64, threshold_bps: u32, state: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pt_mile"), invoice_id),
+        (threshold_bps, state, event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #912: Payment velocity limit events
+// ---------------------------------------------------------------------------
+
+/// Emitted when the default (`payer = None`) or a per-payer velocity config
+/// is set. A cleared override is reported with all limits at zero.
+/// Topics: (split, vel_cfg)
+/// Data: (payer, max_payments, max_amount, window_secs)
+pub fn velocity_config_set(
+    env: &Env,
+    payer: Option<Address>,
+    max_payments: u32,
+    max_amount: i128,
+    window_secs: u64,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("vel_cfg")),
+        (payer, max_payments, max_amount, window_secs),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #913: Split rules engine events
+// ---------------------------------------------------------------------------
+
+/// Emitted when an invoice's split rules are set (`rule_count > 0`) or cleared.
+/// Topics: (split, srules, invoice_id)
+/// Data: (rule_count, event_seq)
+pub fn split_rules_set(env: &Env, invoice_id: u64, rule_count: u32) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("srules"), invoice_id),
+        (rule_count, event_seq),
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Unit tests for the per-invoice event sequence counter (issue #708)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Issue #918: Invoice prioritization
+// ---------------------------------------------------------------------------
+
+/// Issue #918: Emitted when an invoice's priority is set or updated.
+/// Topics: (split, pri_set, invoice_id)
+/// Data: (set_by, old_score, new_score, tier, event_seq)
+pub fn invoice_priority_set(
+    env: &Env,
+    invoice_id: u64,
+    set_by: &Address,
+    old_score: Option<u32>,
+    new_score: u32,
+    tier: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_set"), invoice_id),
+        (set_by.clone(), old_score, new_score, tier, event_seq),
+    );
+}
+
+/// Issue #918: Emitted when an invoice's priority is cleared.
+/// Topics: (split, pri_clr, invoice_id)
+/// Data: (cleared_by, event_seq)
+pub fn invoice_priority_cleared(env: &Env, invoice_id: u64, cleared_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("pri_clr"), invoice_id),
+        (cleared_by.clone(), event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #919: Creator fee tier system
+// ---------------------------------------------------------------------------
+
+/// Issue #919: Emitted when the creator fee tier table is replaced, updated or
+/// cleared (`version == 0`, `tier_count == 0` on clear).
+/// Topics: (split, cfee_cfg)
+/// Data: (version, tier_count)
+pub fn creator_fee_tiers_configured(env: &Env, version: u32, tier_count: u32) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_cfg")),
+        (version, tier_count),
+    );
+}
+
+/// Issue #919: Emitted when a creator's tracked fee tier changes.
+/// Topics: (split, cfee_chg, creator)
+/// Data: (old_tier_id, new_tier_id, fee_bps, volume)
+pub fn creator_fee_tier_changed(
+    env: &Env,
+    creator: &Address,
+    old_tier_id: Option<u32>,
+    new_tier_id: u32,
+    fee_bps: u32,
+    volume: i128,
+) {
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("cfee_chg"), creator.clone()),
+        (old_tier_id, new_tier_id, fee_bps, volume),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #920: Invoice metadata storage
+// ---------------------------------------------------------------------------
+
+/// Issue #920: Emitted when a metadata entry is created or overwritten.
+/// Topics: (split, meta_set, invoice_id)
+/// Data: (key, version, updated_by, event_seq)
+pub fn invoice_metadata_set(
+    env: &Env,
+    invoice_id: u64,
+    key: &String,
+    version: u32,
+    updated_by: &Address,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_set"), invoice_id),
+        (key.clone(), version, updated_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when a metadata entry is removed.
+/// Topics: (split, meta_del, invoice_id)
+/// Data: (key, removed_by, event_seq)
+pub fn invoice_metadata_removed(env: &Env, invoice_id: u64, key: &String, removed_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_del"), invoice_id),
+        (key.clone(), removed_by.clone(), event_seq),
+    );
+}
+
+/// Issue #920: Emitted when an invoice's metadata is permanently locked.
+/// Topics: (split, meta_lck, invoice_id)
+/// Data: (locked_by, event_seq)
+pub fn invoice_metadata_locked(env: &Env, invoice_id: u64, locked_by: &Address) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("meta_lck"), invoice_id),
+        (locked_by.clone(), event_seq),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #921: Confidential payment tracking
+// ---------------------------------------------------------------------------
+
+/// Issue #921: Emitted when a confidential payment is recorded or replaced.
+/// Carries only a digest of the commitment — never an amount.
+/// Topics: (split, ctrk_rec, invoice_id)
+/// Data: (payer, commitment_digest, revision, event_seq)
+pub fn confidential_payment_recorded(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    commitment_digest: &BytesN<32>,
+    revision: u32,
+) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_rec"), invoice_id),
+        (payer.clone(), commitment_digest.clone(), revision, event_seq),
+    );
+}
+
+/// Issue #921: Emitted when the creator proves the confidential invoice total.
+/// Topics: (split, ctrk_ver, invoice_id)
+/// Data: (verified_by, total, event_seq)
+pub fn confidential_total_verified(env: &Env, invoice_id: u64, verified_by: &Address, total: i128) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("ctrk_ver"), invoice_id),
+        (verified_by.clone(), total, event_seq),
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -2048,50 +2563,56 @@ mod tests {
         });
     }
 
-    /// `guard_failed` publishes a `guard_fail` event carrying the guard in
-    /// topic[2] and a full `GuardFailure` payload in the data.
+    /// Issue #954: `PaymentBreakdown` preserves gross/fee/net values and the
+    /// `PaymentEvent` metadata is populated correctly.
     #[test]
-    fn test_guard_failed_emits_event_with_data() {
-        use soroban_sdk::testutils::Events as _;
-        use soroban_sdk::{String, Symbol};
-
+    fn test_payment_event_breakdown_accuracy() {
         let env = Env::default();
-        let id = contract_id(&env);
-        let actor = Address::generate(&env);
-        let guard = symbol_short!("paused");
-        let detail = String::from_str(&env, "invoice paused");
+        let recipient = Address::generate(&env);
+        let payer = Address::generate(&env);
 
-        env.as_contract(&id, || {
-            guard_failed(&env, &guard, 42, &actor, &detail);
-        });
+        let entry = PaymentBreakdown {
+            recipient: recipient.clone(),
+            gross: 1_000,
+            fee: 25,
+            net: 975,
+        };
+        assert_eq!(entry.gross - entry.fee, entry.net);
 
-        let events = env.events().all();
-        let last = events.last().expect("expected a guard_fail event");
-        let (emitter, topics, data) = last;
-        assert_eq!(emitter, id);
-        assert_eq!(topics.len(), 3);
-        assert_eq!(
-            topics.get(1).unwrap(),
-            soroban_sdk::Val::from(symbol_short!("guard_fail"))
-        );
-        assert_eq!(topics.get(2).unwrap(), soroban_sdk::Val::from(guard));
+        let mut breakdown = Vec::new(&env);
+        breakdown.push_back(entry.clone());
 
-        let payload: GuardFailure = soroban_sdk::FromVal::from_val(&env, &data);
-        assert_eq!(payload.guard, symbol_short!("paused"));
-        assert_eq!(payload.invoice_id, 42);
-        assert_eq!(payload.actor, actor);
-        assert_eq!(payload.detail, detail);
+        let event = PaymentEvent {
+            metadata: PaymentEventMetadata {
+                invoice_id: 42,
+                payer: payer.clone(),
+                timestamp: 1234,
+                total: 1_000,
+            },
+            breakdown: breakdown.clone(),
+        };
+
+        assert_eq!(event.metadata.invoice_id, 42);
+        assert_eq!(event.metadata.payer, payer);
+        assert_eq!(event.metadata.timestamp, 1234);
+        assert_eq!(event.metadata.total, 1_000);
+        assert_eq!(event.breakdown.len(), 1);
+        assert_eq!(event.breakdown.get(0).unwrap(), entry);
     }
 
-    /// `guard_names` returns a non-empty, deduplicated list of guard symbols.
+    /// Issue #956: `RefundReason` variants are distinct and comparable.
     #[test]
-    fn test_guard_names_enumerates_guards() {
-        let env = Env::default();
-        let names = guard_names(&env);
-        assert!(!names.is_empty());
-        for i in 0..names.len() {
-            for j in (i + 1)..names.len() {
-                assert_ne!(names.get(i).unwrap(), names.get(j).unwrap());
+    fn test_refund_reason_variants() {
+        let reasons = [
+            RefundReason::Expired,
+            RefundReason::Cancelled,
+            RefundReason::Dispute,
+            RefundReason::AdminOverride,
+            RefundReason::Overpayment,
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for (j, b) in reasons.iter().enumerate() {
+                assert_eq!(i == j, a == b);
             }
         }
     }
