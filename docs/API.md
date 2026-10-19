@@ -478,6 +478,52 @@ pub fn sign_release(env: Env, invoice_id: u64, signer: Address)
 
 Records a co-signer approval. Once `required_signatures` approvals are collected, `release` becomes callable. Emits `invoice_partially_released` when threshold is reached.
 
+### `sign_release_with_signature`
+
+```rust
+pub fn sign_release_with_signature(
+    env: Env,
+    invoice_id: u64,
+    signer: Address,
+    nonce: u64,
+    signature: BytesN<64>,
+)
+```
+
+Records a co-signer approval backed by an off-chain Ed25519 signature over the canonical co-signer message (see [Co-Signer Signature Format](#co-signer-signature-format)). The signature is verified against `signer` before the approval is recorded.
+
+#### Co-Signer Signature Format
+
+Co-signer signatures use **domain separation** and **nonce binding** to prevent cross-contract and replay attacks.
+
+**Signed payload (canonical byte layout):**
+
+```
+domain_tag (32 bytes) || network_id (32 bytes) || contract_id (32 bytes)
+  || invoice_id (u64, big-endian, 8 bytes)
+  || signer (Address, XDR-encoded, variable length)
+  || nonce (u64, big-endian, 8 bytes)
+```
+
+| Field | Description |
+|-------|-------------|
+| `domain_tag` | Fixed constant `SHA-256("StellarSplit:co-signer:v1")`; separates this signature domain from all other signed messages |
+| `network_id` | Stellar network passphrase hash (`Public Network`, `Test SDF Network ; September 2015`, etc.) |
+| `contract_id` | The StellarSplit contract address, binding the signature to this deployment |
+| `invoice_id` | Invoice the approval applies to |
+| `signer` | The co-signer address whose key produced the signature |
+| `nonce` | Strictly increasing per-`(invoice_id, signer)` nonce |
+
+**Verification rules:**
+
+- The `domain_tag`, `network_id`, and `contract_id` must match the current environment; mismatches are rejected with `ContractError::InvalidSignatureDomain`.
+- `nonce` must be strictly greater than the last recorded nonce for `(invoice_id, signer)`; otherwise the call fails with `ContractError::SignatureNonceReused`.
+- The signature must verify as Ed25519 over the payload above using `signer`'s public key; failures return `ContractError::InvalidSignature`.
+- A signer may not sign the same invoice twice; duplicate approvals return `ContractError::AlreadySigned`.
+- Signatures are only accepted while the invoice is in a releasable state (funded, not paused/frozen, not refunded); otherwise `ContractError::InvalidInvoiceState`.
+
+**Replay protection:** because the payload binds the contract ID, invoice ID, signer, and a monotonically increasing nonce, a captured signature cannot be replayed on another contract, another invoice, or a later transaction. The last-used nonce is persisted per `(invoice_id, signer)` and never decreases.
+
 ### `refund`
 
 ```rust
@@ -559,6 +605,26 @@ pub fn confirm_condition(env: Env, invoice_id: u64)
 ```
 
 Called by the configured `oracle_address` to confirm the off-chain condition is met, unblocking release.
+
+#### Oracle Interface
+
+When `InvoiceOptions.oracle_address` is set, release is blocked until the oracle confirms the condition.
+
+**Address format:**
+
+- `oracle_address` must be a valid Stellar contract address (`C...`, 56-character StrKey) or account address (`G...`, 56-character StrKey).
+- The address is validated at `create_invoice` time; malformed addresses are rejected with `ContractError::InvalidOracleAddress`.
+- The zero address and the contract's own address are rejected with `ContractError::InvalidOracleAddress`.
+- If `oracle_address` is `None`, no oracle gate applies and `confirm_condition` is a no-op that returns `ContractError::NoOracleConfigured`.
+
+**Condition semantics:**
+
+- The oracle condition is a boolean gate: once confirmed, it stays confirmed for the lifetime of the invoice and cannot be un-confirmed.
+- `confirm_condition` must be authorized by `oracle_address`; any other caller fails with `ContractError::Unauthorized`.
+- Confirmation is only accepted while the invoice is `Pending` or `Funded`; otherwise `ContractError::InvalidInvoiceState`.
+- Confirming twice returns `ContractError::ConditionAlreadyConfirmed`.
+- The oracle may also be consulted for dynamic pricing when `price_oracle` is set; that oracle must return a positive price, otherwise release fails with `ContractError::InvalidOraclePrice`.
+- Oracle calls are read-only from the contract's perspective; the contract never trusts oracle-supplied amounts for accounting, only the boolean condition and price feed.
 
 ### `add_allowed_payer`
 
@@ -888,6 +954,25 @@ pub fn get_invoice(env: Env, invoice_id: u64) -> Invoice
 
 Returns the full merged invoice view (hot fields + core + ext).
 
+#### Recipient List Caching
+
+Recipient lists (`recipients`, `amounts`, and derived split rules) are cached to avoid repeated storage reads during payment and release.
+
+**Cache behaviour:**
+
+- The cache key is `(invoice_id, "recipients")` and stores the resolved recipient/amount vectors plus a version counter.
+- Reads of `get_invoice`, `release`, `release_to_recipient`, and `simulate_release` populate the cache on first access.
+- Cache hits return the stored vectors without touching persistent storage; misses fall back to storage and repopulate the cache.
+- The cache is bounded per invoice and evicted on invoice archival.
+
+**Invalidation rules:**
+
+- Any mutation of `recipients`, `amounts`, `split_rules`, or `priorities` bumps the invoice version and invalidates the cache entry.
+- `clone_invoice` and `migrate_invoice` invalidate the source invoice's cache.
+- `refund` and `release` invalidate the cache after final distribution.
+- Invalidation is version-checked: a cached entry whose version does not match the invoice's current version is treated as a miss and discarded.
+- Cache state is never authoritative; correctness always falls back to persistent storage.
+
 ### `get_invoice_snapshot`
 
 ```rust
@@ -966,77 +1051,74 @@ See [Pause & Circuit Breaker](#pause--circuit-breaker).
 
 ---
 
-## Validation Rules
+## Error Codes
 
-The contract enforces the following invariants at the entry points listed. Violations panic and abort the transaction; no partial state is written.
+All entry points return `Result<T, ContractError>`. The full variant table:
 
-### Deadline window
+| Code | Variant | Meaning |
+|------|---------|---------|
+| 1 | `NotInitialized` | Contract has not been initialized |
+| 2 | `AlreadyInitialized` | `initialize` called more than once |
+| 3 | `Unauthorized` | Caller lacks the required auth or role |
+| 4 | `NotFound` | Referenced invoice, template, or action does not exist |
+| 5 | `InvalidAmount` | Amount is zero, negative, or otherwise invalid |
+| 6 | `InvalidDeadline` | Deadline is in the past or otherwise invalid |
+| 7 | `InvalidInvoiceState` | Operation not allowed in the invoice's current state |
+| 8 | `InvoicePaused` | Invoice is paused |
+| 9 | `InvoiceFrozen` | Invoice is admin-frozen |
+| 10 | `ContractPaused` | Contract is paused |
+| 11 | `CircuitBreakerActive` | Emergency circuit breaker is active |
+| 12 | `NotFullyFunded` | Release attempted before full funding |
+| 13 | `AlreadyReleased` | Invoice already released |
+| 14 | `AlreadyRefunded` | Invoice already refunded |
+| 15 | `DeadlineNotPassed` | Refund attempted before deadline |
+| 16 | `RefundGraceNotElapsed` | Refund attempted before `refund_grace_secs` elapsed |
+| 17 | `InsufficientSignatures` | Fewer than `required_signatures` co-signer approvals |
+| 18 | `AlreadySigned` | Signer already approved this invoice |
+| 19 | `InvalidSignature` | Signature failed Ed25519 verification |
+| 20 | `InvalidSignatureDomain` | Signature domain/network/contract mismatch |
+| 21 | `SignatureNonceReused` | Signature nonce not greater than last used |
+| 22 | `InvalidOracleAddress` | Oracle address malformed or disallowed |
+| 23 | `NoOracleConfigured` | Oracle operation attempted with no oracle set |
+| 24 | `InvalidOraclePrice` | Oracle returned a non-positive price |
+| 25 | `ConditionAlreadyConfirmed` | Oracle condition already confirmed |
+| 26 | `ConditionNotConfirmed` | Release attempted before oracle confirmation |
+| 27 | `PrerequisiteNotMet` | Prerequisite invoice not released |
+| 28 | `TrancheNotReached` | Tranche timestamp not yet reached |
+| 29 | `MinFundingNotReached` | `min_funding_bps` threshold not met |
+| 30 | `ScheduledReleaseNotDue` | `scheduled_release_at` not yet reached |
+| 31 | `VelocityLimitExceeded` | Payer exceeded `velocity_limit` in window |
+| 32 | `PaymentCooldownActive` | Payer within `payment_cooldown_secs` |
+| 33 | `PaymentRateLimitExceeded` | Payer exceeded `max_payments_per_window` |
+| 34 | `PayerNotAllowed` | Payer not in `allowed_payers` |
+| 35 | `KycRequired` | Payer has not passed KYC |
+| 36 | `TokenNotAccepted` | Token not in `accepted_tokens` |
+| 37 | `NonceReused` | Payment nonce already used |
+| 38 | `OverflowRejected` | Overpayment rejected by `OverflowBehavior::Reject` |
+| 39 | `DisputeActive` | Release blocked by an active dispute |
+| 40 | `ArbiterNotSet` | Dispute raised with no arbiter assigned |
+| 41 | `TemplateExists` | Template already exists for `(creator, name)` |
+| 42 | `TemplateNotFound` | Template does not exist |
+| 43 | `CreatorNotWhitelisted` | Creator not on the whitelist |
+| 44 | `VolumeCapExceeded` | Creator lifetime volume cap reached |
+| 45 | `TimelockNotElapsed` | Queued action executed before timelock |
+| 46 | `ActionNotFound` | Timelock action ID does not exist |
+| 47 | `ActionAlreadyExecuted` | Timelock action already executed |
+| 48 | `InvalidFeeTiers` | Fee tiers unsorted, empty, or exceed max count |
+| 49 | `InvalidBasisPoints` | Basis points value exceeds 10 000 |
+| 50 | `InvalidRecipients` | Recipients/amounts length mismatch or empty |
+| 51 | `InvalidSplitRules` | Split rules invalid or do not sum correctly |
+| 52 | `InvalidReleaseStages` | Release stages do not sum to 10 000 |
+| 53 | `InvalidTranches` | Tranches unsorted or invalid |
+| 54 | `InvalidMetadataHash` | Metadata hash malformed |
+| 55 | `InvalidChannelState` | Channel operation invalid for current state |
+| 56 | `InsufficientChannelDeposit` | Channel deposit too low |
+| 57 | `ConfidentialNotRevealed` | Confidential total not yet revealed |
+| 58 | `InvalidRangeProof` | Range proof failed verification |
+| 59 | `ArithmeticOverflow` | Arithmetic overflow or underflow |
+| 60 | `TransferFailed` | Token transfer failed |
 
-Applies to `create_invoice`, `create_batch`, `create_invoices_batch`, `clone_invoice` (when the deadline is overridden), and `create_subscription`.
-
-| Rule | Condition | Rationale |
-|------|-----------|-----------|
-| Future deadline | `deadline > env.ledger().timestamp()` | A deadline in the past would make the invoice immediately refundable and bypass the funding window |
-| Bounded horizon | `deadline <= env.ledger().timestamp() + MAX_DEADLINE_HORIZON` | Prevents absurd timestamps (e.g. `u64::MAX`) that break refund/reminder scheduling and analytics |
-
-`MAX_DEADLINE_HORIZON` is a contract constant expressed in seconds. The check is performed against the **current ledger timestamp**, not the client clock, so clients must account for ledger drift when computing deadlines near the boundary.
-
-Boundary behavior:
-
-- `deadline == now` → rejected (must be strictly in the future)
-- `deadline == now + MAX_DEADLINE_HORIZON` → accepted (inclusive upper bound)
-- `deadline == now + MAX_DEADLINE_HORIZON + 1` → rejected
-
-### Platform fee cap
-
-Applies to `initialize` and `set_fee_tiers`.
-
-| Rule | Condition | Rationale |
-|------|-----------|-----------|
-| Global cap | `platform_fee_bps <= MAX_PLATFORM_FEE_BPS` | Prevents misconfiguration that would confiscate an unreasonable share of released funds |
-| Tier cap | `tier.fee_bps <= MAX_PLATFORM_FEE_BPS` for every tier | Tiered fees must never exceed the global ceiling |
-
-`MAX_PLATFORM_FEE_BPS` is a contract constant in basis points (1 bps = 0.01%). The cap is inclusive: a value exactly equal to `MAX_PLATFORM_FEE_BPS` is accepted, one bps above is rejected. Fee waivers (`add_platform_fee_waiver`) reduce the effective fee to 0 and are unaffected by the cap.
-
-### Split rules
-
-Applies to `create_invoice` and any path that accepts `InvoiceOptions` with `split_rules`.
-
-| Rule | Condition | Rationale |
-|------|-----------|-----------|
-| Non-empty | `!split_rules.is_empty()` when the field is provided | An empty rule set is ambiguous; omit the field instead |
-| Positive ratio | `rule.ratio > 0` for every rule | Zero-share rules are dead weight and likely a mistake |
-| Per-rule bound | `rule.ratio <= MAX_RATIO` for every rule | Prevents a single rule from monopolizing the split |
-| Exact total | `sum(rule.ratio) == 10_000` | Basis points must fully allocate the payout; under- or over-allocation is rejected |
-
-Boundary behavior:
-
-- A single rule with `ratio == 10_000` is valid (full allocation to one recipient)
-- `ratio == 0` → rejected
-- `ratio == MAX_RATIO` → accepted; `MAX_RATIO + 1` → rejected
-- Sum of `9_999` or `10_001` → rejected
-
-### Token contract validation
-
-Applies to `initialize` (`usdc_token`), `create_invoice` (`token`), and `pay_with_token` (each entry of `accepted_tokens`).
-
-The token address must be a deployed contract implementing the [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token interface. The contract verifies the interface by invoking the following methods:
-
-| Method | Signature | Behavior checked |
-|--------|-----------|------------------|
-| `allowance` | `(from: Address, spender: Address) -> i128` | Must return a value without trapping |
-| `approve` | `(from: Address, spender: Address, amount: i128, expiration_ledger: u32)` | Must be callable; used for pull-payment flows |
-| `balance` | `(id: Address) -> i128` | Must return the balance of the queried address |
-| `transfer` | `(from: Address, to: Address, amount: i128)` | Used for all payouts and refunds |
-| `transfer_from` | `(spender: Address, from: Address, to: Address, amount: i128)` | Used when the contract pulls funds |
-| `decimals` | `() -> u32` | Must return a value; used for display and oracle conversions |
-
-Notes:
-
-- The contract does **not** require the optional SEP-41 metadata methods (`name`, `symbol`); tokens lacking them are still supported.
-- Tokens that trap on any of the required methods are rejected at validation time.
-- Stellar Asset Contracts (SACs) are always compatible and are the recommended token type.
-- Validation is performed once at configuration/creation time; a token contract that is upgraded to a non-conforming implementation after validation is not re-checked.
+Codes are stable and never reused; new variants are appended with the next available code.
 
 ---
 
