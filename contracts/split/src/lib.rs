@@ -35,8 +35,29 @@ const INSTRUCTIONS_BASE: u64 = 1_000_000;
 /// Issue #298: Stroops per 10_000 instructions (rough estimate based on Soroban fee schedule).
 const STROOPS_PER_10K_INSTRUCTIONS: u64 = 1;
 
+/// Issue #924: Estimate counted as accurate when within this error of actual (10%).
+const COST_ESTIMATE_TOLERANCE_BPS: u64 = 1_000;
+/// Issue #924: Maximum distinct operations tracked by the profiler.
+const MAX_PROFILED_OPERATIONS: u32 = 32;
+
+/// Issue #925: Default maximum invoices per payment batch.
+const DEFAULT_PAYMENT_BATCH_LIMIT: u32 = 25;
+/// Issue #925: Hard upper bound an admin may raise the batch limit to.
+const MAX_PAYMENT_BATCH_LIMIT: u32 = 50;
+
 /// Issue #296: Maximum entries in the per-creator fee waiver list.
 const MAX_FEE_WAIVER_ENTRIES: usize = 100;
+/// Issue #922: Maximum entries retained in the fee waiver audit log (oldest dropped first).
+const MAX_FEE_WAIVER_AUDIT_ENTRIES: u32 = 200;
+
+/// Issue #923: Default failures within the window that trip the circuit breaker.
+const DEFAULT_CB_FAILURE_THRESHOLD: u32 = 3;
+/// Issue #923: Default failure counting window (~1 hour at ~5 s/ledger).
+const DEFAULT_CB_FAILURE_WINDOW_LEDGERS: u32 = 720;
+/// Issue #923: Default HalfOpen probation before recovery can complete (~10 min).
+const DEFAULT_CB_RECOVERY_LEDGERS: u32 = 120;
+/// Issue #923: Maximum circuit breaker transitions retained in history.
+const MAX_CB_HISTORY_ENTRIES: u32 = 50;
 const DEFAULT_COMMITMENT_EXPIRY_LEDGERS: u32 = 100;
 
 /// Fixed-point scale for oracle-priced invoices: the oracle's `price()` return
@@ -100,7 +121,8 @@ use types::{
     ArchivalStatus, AuditEntry, Bid, CircuitBreakerStatus,
     CloneOverrides, CloneRecord, CompactInvoice, CompactMigrateResult, CompletionProof, ComputeEstimate,
     ConfidentialPayment, ContributionResult, CreateInvoiceParams, CreatorStats, DelayedPayout,
-    DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, InstalmentPlan,
+    DisputeOutcome, DisputeRecord, DisputeStatus, FeeBracket, FeeSplit, FeeTier, FeeWaiver,
+    FeeWaiverAction, FeeWaiverAuditEntry, InstalmentPlan,
     Invoice, InvoiceCore, InvoiceExt, InvoiceExt2, InvoiceExt3, InvoiceHot, InvoiceOptions,
     InvoiceOptions2, InvoicePayment, InvoiceStats, InvoiceStatus, InvoiceTemplate,
     InvoiceTemplateRecord, LegacyInvoice, OperationSnapshot, RecipientAuth, RecipientAuthLogEntry, RecipientAuthStatus, OverflowBehavior, OverfundingPolicy, Payment,
@@ -191,6 +213,16 @@ fn creator_fee_waiver_key() -> Symbol {
     symbol_short!("cr_fw")
 }
 
+/// Issue #922: Per-creator fee waiver record (grantor, expiry, reason).
+fn fee_waiver_record_key(creator: &Address) -> (Symbol, Address) {
+    (symbol_short!("fw_rec"), creator.clone())
+}
+
+/// Issue #922: Bounded fee waiver audit log.
+fn fee_waiver_audit_key() -> Symbol {
+    symbol_short!("fw_audit")
+}
+
 /// Issue #297: Circuit breaker active flag key.
 fn circuit_breaker_key() -> Symbol {
     symbol_short!("cb_flag")
@@ -199,6 +231,91 @@ fn circuit_breaker_key() -> Symbol {
 /// Issue #297: Circuit breaker reason storage key.
 fn circuit_breaker_reason_key() -> Symbol {
     symbol_short!("cb_rsn")
+}
+
+/// Issue #923: Circuit breaker state machine position.
+fn circuit_breaker_state_key() -> Symbol {
+    symbol_short!("cb_state")
+}
+
+/// Issue #923: Circuit breaker activation / recovery configuration.
+fn circuit_breaker_config_key() -> Symbol {
+    symbol_short!("cb_cfg")
+}
+
+/// Issue #923: Operations (function symbols) allowed while the breaker is open.
+fn circuit_breaker_exempt_key() -> Symbol {
+    symbol_short!("cb_exempt")
+}
+
+/// Issue #923: (failure_count, window_start_ledger) for auto-trip detection.
+fn circuit_breaker_failures_key() -> Symbol {
+    symbol_short!("cb_fails")
+}
+
+/// Issue #923: Ledger at which the breaker last opened.
+fn circuit_breaker_opened_key() -> Symbol {
+    symbol_short!("cb_open")
+}
+
+/// Issue #923: Ledger at which HalfOpen recovery began.
+fn circuit_breaker_recovery_key() -> Symbol {
+    symbol_short!("cb_recov")
+}
+
+/// Issue #923: Bounded history of state transitions.
+fn circuit_breaker_history_key() -> Symbol {
+    symbol_short!("cb_hist")
+}
+
+/// Issue #925: Next payment batch id counter.
+fn payment_batch_next_id_key() -> Symbol {
+    symbol_short!("pb_next")
+}
+
+/// Issue #925: Payment batch record.
+fn payment_batch_key(batch_id: u64) -> (Symbol, u64) {
+    (symbol_short!("pay_bat"), batch_id)
+}
+
+/// Issue #925: Admin-configured maximum invoices per batch.
+fn payment_batch_limit_key() -> Symbol {
+    symbol_short!("pb_limit")
+}
+
+/// Issue #925: Cumulative batching metrics.
+fn payment_batch_stats_key() -> Symbol {
+    symbol_short!("pb_stats")
+}
+
+/// Issue #924: Admin-configured cost model override for an operation.
+fn cost_model_key(operation: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("cost_mdl"), operation.clone())
+}
+
+/// Issue #924: Version counter bumped whenever a model or calibration changes.
+fn cost_model_version_key() -> Symbol {
+    symbol_short!("cost_ver")
+}
+
+/// Issue #924: Per-operation profiling data.
+fn cost_profile_key(operation: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("cost_prf"), operation.clone())
+}
+
+/// Issue #924: Operations that have profiling data.
+fn cost_profiled_ops_key() -> Symbol {
+    symbol_short!("cost_ops")
+}
+
+/// Issue #924: Cached estimate per (operation, recipients, payers, items) — temporary storage.
+fn cost_cache_key(
+    operation: &Symbol,
+    recipients: u32,
+    payers: u32,
+    items: u32,
+) -> (Symbol, Symbol, u32, u32, u32) {
+    (symbol_short!("cost_c"), operation.clone(), recipients, payers, items)
 }
 
 /// Issue #295: Confidential payment storage key per (invoice_id, payer).
@@ -2243,12 +2360,19 @@ fn assert_not_paused(env: &Env) -> Result<(), ContractError> {
         return Err(ContractError::ContractPaused);
     }
     // Issue #297: also check circuit breaker.
-    let cb_active: bool = env
-        .storage()
-        .persistent()
-        .get(&circuit_breaker_key())
-        .unwrap_or(false);
-    if cb_active {
+    if circuit_breaker_blocks(env, None) {
+        return Err(ContractError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Issue #923: Same as [`assert_not_paused`], but lets `function` through an
+/// open circuit breaker when it is on the exemption list.
+fn assert_not_paused_for(env: &Env, function: &Symbol) -> Result<(), ContractError> {
+    if is_paused(env) {
+        return Err(ContractError::ContractPaused);
+    }
+    if circuit_breaker_blocks(env, Some(function)) {
         return Err(ContractError::ContractPaused);
     }
     Ok(())
@@ -2310,7 +2434,8 @@ fn require_admin_role_unguarded(env: &Env, admin: &Address, min_role: AdminRole)
 }
 
 fn require_fn_not_paused(env: &Env, name: &Symbol) {
-    require_not_paused(env);
+    migrations::require_schema_current(env);
+    assert_not_paused_for(env, name).expect("contract is paused");
     let paused_fns: Vec<Symbol> = env
         .storage()
         .persistent()
@@ -2319,6 +2444,425 @@ fn require_fn_not_paused(env: &Env, name: &Symbol) {
     if paused_fns.iter().any(|f| f == *name) {
         panic!("function paused");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #925: Payment batching helpers
+// ---------------------------------------------------------------------------
+
+fn load_payment_batch(env: &Env, batch_id: u64) -> PaymentBatch {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_key(batch_id))
+        .expect("batch not found")
+}
+
+/// Load a batch the payer may still modify.
+fn load_open_payment_batch(env: &Env, batch_id: u64, payer: &Address) -> PaymentBatch {
+    let batch = load_payment_batch(env, batch_id);
+    assert!(batch.payer == *payer, "not batch owner");
+    assert!(batch.status == PaymentBatchStatus::Open, "batch is not open");
+    batch
+}
+
+fn payment_batch_limit(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_limit_key())
+        .unwrap_or(DEFAULT_PAYMENT_BATCH_LIMIT)
+}
+
+fn load_batching_stats(env: &Env) -> BatchingStats {
+    env.storage()
+        .persistent()
+        .get(&payment_batch_stats_key())
+        .unwrap_or(BatchingStats {
+            batches_executed: 0,
+            items_processed: 0,
+            total_volume: 0,
+            transfers_saved: 0,
+            estimated_insns_saved: 0,
+            last_savings_bps: 0,
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Issue #924: Compute cost estimation helpers
+// ---------------------------------------------------------------------------
+
+/// Built-in cost models, derived from the `estimate_compute` constants.
+fn default_cost_model(operation: &Symbol) -> Option<OperationCostModel> {
+    let shard_overhead = INSTRUCTIONS_PER_SHARD * SHARD_COUNT;
+    let model = if *operation == symbol_short!("create") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE,
+            per_recipient_insns: 200_000,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 128 * 1024,
+            per_unit_mem_bytes: 64 * 1024,
+        }
+    } else if *operation == symbol_short!("pay") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: INSTRUCTIONS_PER_RECIPIENT / 2,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 16 * 1024,
+        }
+    } else if *operation == symbol_short!("release") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: INSTRUCTIONS_PER_RECIPIENT,
+            per_payer_insns: 0,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else if *operation == symbol_short!("refund") {
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: 0,
+            per_payer_insns: 350_000,
+            per_item_insns: 0,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else if *operation == symbol_short!("batch_pay") {
+        // One token transfer + setup, then internal accounting per batched invoice.
+        OperationCostModel {
+            base_insns: INSTRUCTIONS_BASE + shard_overhead,
+            per_recipient_insns: 0,
+            per_payer_insns: 0,
+            per_item_insns: 400_000,
+            base_mem_bytes: 256 * 1024,
+            per_unit_mem_bytes: 32 * 1024,
+        }
+    } else {
+        return None;
+    };
+    Some(model)
+}
+
+fn load_cost_model(env: &Env, operation: &Symbol) -> OperationCostModel {
+    env.storage()
+        .persistent()
+        .get(&cost_model_key(operation))
+        .or_else(|| default_cost_model(operation))
+        .expect("unknown operation")
+}
+
+fn cost_model_version(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&cost_model_version_key())
+        .unwrap_or(0)
+}
+
+fn bump_cost_model_version(env: &Env) {
+    let next = cost_model_version(env).wrapping_add(1);
+    env.storage()
+        .persistent()
+        .set(&cost_model_version_key(), &next);
+}
+
+fn load_operation_profile(env: &Env, operation: &Symbol) -> Option<OperationProfile> {
+    env.storage().persistent().get(&cost_profile_key(operation))
+}
+
+/// actual / raw-estimate ratio from profiling data, in bps (10_000 when unprofiled).
+fn cost_calibration_bps(profile: &Option<OperationProfile>) -> u32 {
+    match profile {
+        Some(p) if p.total_raw_estimated_insns > 0 => {
+            let bps = (p.total_actual_insns as u128) * 10_000
+                / (p.total_raw_estimated_insns as u128);
+            bps.min(u32::MAX as u128) as u32
+        }
+        _ => 10_000,
+    }
+}
+
+fn raw_cost_insns(model: &OperationCostModel, recipients: u32, payers: u32, items: u32) -> u64 {
+    model
+        .base_insns
+        .saturating_add((recipients as u64).saturating_mul(model.per_recipient_insns))
+        .saturating_add((payers as u64).saturating_mul(model.per_payer_insns))
+        .saturating_add((items as u64).saturating_mul(model.per_item_insns))
+}
+
+/// Compute an estimate from the current model and calibration (no caching).
+fn compute_cost_estimate(
+    env: &Env,
+    operation: &Symbol,
+    recipients: u32,
+    payers: u32,
+    items: u32,
+) -> CostEstimate {
+    let model = load_cost_model(env, operation);
+    let raw_cpu_insns = raw_cost_insns(&model, recipients, payers, items);
+    let calibration_bps = cost_calibration_bps(&load_operation_profile(env, operation));
+    let cpu_insns = ((raw_cpu_insns as u128) * (calibration_bps as u128) / 10_000)
+        .min(u64::MAX as u128) as u64;
+    let units = (recipients as u64) + (payers as u64) + (items as u64);
+    let mem_bytes = model
+        .base_mem_bytes
+        .saturating_add(units.saturating_mul(model.per_unit_mem_bytes));
+    CostEstimate {
+        operation: operation.clone(),
+        cpu_insns,
+        raw_cpu_insns,
+        mem_bytes,
+        fee_stroops: (cpu_insns as i128 / 10_000) * STROOPS_PER_10K_INSTRUCTIONS as i128,
+        calibration_bps,
+        within_budget: cpu_insns <= INSTRUCTION_BUDGET_LIMIT,
+        cached: false,
+        model_version: cost_model_version(env),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #923: Circuit breaker helpers
+// ---------------------------------------------------------------------------
+
+/// True when the breaker is open and `function` (if given) is not exempt.
+/// With `function == None` no exemption applies.
+fn circuit_breaker_blocks(env: &Env, function: Option<&Symbol>) -> bool {
+    let active: bool = env
+        .storage()
+        .persistent()
+        .get(&circuit_breaker_key())
+        .unwrap_or(false);
+    if !active {
+        return false;
+    }
+    match function {
+        Some(f) => !load_circuit_breaker_exemptions(env).iter().any(|e| e == *f),
+        None => true,
+    }
+}
+
+fn load_circuit_breaker_exemptions(env: &Env) -> Vec<Symbol> {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_exempt_key())
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Current state. Contracts that only ever set the issue #297 flag have no
+/// stored state, so it is derived from the flag.
+fn load_circuit_breaker_state(env: &Env) -> CircuitBreakerState {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_state_key())
+        .unwrap_or_else(|| {
+            let active: bool = env
+                .storage()
+                .persistent()
+                .get(&circuit_breaker_key())
+                .unwrap_or(false);
+            if active {
+                CircuitBreakerState::Open
+            } else {
+                CircuitBreakerState::Closed
+            }
+        })
+}
+
+fn load_circuit_breaker_config(env: &Env) -> CircuitBreakerConfig {
+    env.storage()
+        .persistent()
+        .get(&circuit_breaker_config_key())
+        .unwrap_or(CircuitBreakerConfig {
+            failure_threshold: DEFAULT_CB_FAILURE_THRESHOLD,
+            failure_window_ledgers: DEFAULT_CB_FAILURE_WINDOW_LEDGERS,
+            recovery_ledgers: DEFAULT_CB_RECOVERY_LEDGERS,
+        })
+}
+
+/// Move the breaker to `to`, keeping the issue #297 flag in sync, and log the transition.
+fn transition_circuit_breaker(
+    env: &Env,
+    to: CircuitBreakerState,
+    actor: &Address,
+    reason: &String,
+) {
+    let from = load_circuit_breaker_state(env);
+    let storage = env.storage().persistent();
+    let ledger = env.ledger().sequence();
+
+    storage.set(&circuit_breaker_state_key(), &to);
+    storage.set(&circuit_breaker_key(), &(to == CircuitBreakerState::Open));
+    storage.remove(&circuit_breaker_failures_key());
+    match to {
+        CircuitBreakerState::Open => {
+            storage.set(&circuit_breaker_reason_key(), reason);
+            storage.set(&circuit_breaker_opened_key(), &ledger);
+            storage.remove(&circuit_breaker_recovery_key());
+        }
+        CircuitBreakerState::HalfOpen => {
+            storage.set(&circuit_breaker_recovery_key(), &ledger);
+        }
+        CircuitBreakerState::Closed => {
+            storage.remove(&circuit_breaker_reason_key());
+            storage.remove(&circuit_breaker_opened_key());
+            storage.remove(&circuit_breaker_recovery_key());
+        }
+    }
+
+    let mut history: Vec<CircuitBreakerTransition> = storage
+        .get(&circuit_breaker_history_key())
+        .unwrap_or_else(|| Vec::new(env));
+    history.push_back(CircuitBreakerTransition {
+        from,
+        to,
+        actor: actor.clone(),
+        reason: reason.clone(),
+        ledger,
+        timestamp: env.ledger().timestamp(),
+    });
+    while history.len() > MAX_CB_HISTORY_ENTRIES {
+        history.pop_front();
+    }
+    storage.set(&circuit_breaker_history_key(), &history);
+
+    events::circuit_breaker_state_changed(env, from, to, actor, reason);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #922: Fee waiver helpers
+// ---------------------------------------------------------------------------
+
+fn load_fee_waiver_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&creator_fee_waiver_key())
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn fee_waiver_is_expired(env: &Env, waiver: &FeeWaiver) -> bool {
+    waiver.expires_at != 0 && env.ledger().timestamp() >= waiver.expires_at
+}
+
+/// True when `creator` is whitelisted and the waiver has not expired.
+/// Entries added before issue #922 carry no record and never expire.
+fn creator_has_active_fee_waiver(env: &Env, creator: &Address) -> bool {
+    if !load_fee_waiver_list(env).iter().any(|a| a == *creator) {
+        return false;
+    }
+    match env
+        .storage()
+        .persistent()
+        .get::<_, FeeWaiver>(&fee_waiver_record_key(creator))
+    {
+        Some(waiver) => !fee_waiver_is_expired(env, &waiver),
+        None => true,
+    }
+}
+
+fn record_fee_waiver_audit(
+    env: &Env,
+    action: FeeWaiverAction,
+    creator: &Address,
+    actor: &Address,
+    expires_at: u64,
+) {
+    let mut log: Vec<FeeWaiverAuditEntry> = env
+        .storage()
+        .persistent()
+        .get(&fee_waiver_audit_key())
+        .unwrap_or_else(|| Vec::new(env));
+    log.push_back(FeeWaiverAuditEntry {
+        action,
+        creator: creator.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+        ledger: env.ledger().sequence(),
+        expires_at,
+    });
+    while log.len() > MAX_FEE_WAIVER_AUDIT_ENTRIES {
+        log.pop_front();
+    }
+    env.storage().persistent().set(&fee_waiver_audit_key(), &log);
+}
+
+/// Remove every expired waiver from the whitelist. Returns the number removed.
+fn purge_expired_fee_waivers_internal(env: &Env, actor: &Address) -> u32 {
+    let waivers = load_fee_waiver_list(env);
+    let mut kept: Vec<Address> = Vec::new(env);
+    let mut removed: u32 = 0;
+    for creator in waivers.iter() {
+        let record: Option<FeeWaiver> = env
+            .storage()
+            .persistent()
+            .get(&fee_waiver_record_key(&creator));
+        match record {
+            Some(waiver) if fee_waiver_is_expired(env, &waiver) => {
+                env.storage()
+                    .persistent()
+                    .remove(&fee_waiver_record_key(&creator));
+                record_fee_waiver_audit(
+                    env,
+                    FeeWaiverAction::Expired,
+                    &creator,
+                    actor,
+                    waiver.expires_at,
+                );
+                events::fee_waiver_expired(env, &creator, waiver.expires_at);
+                removed += 1;
+            }
+            _ => kept.push_back(creator),
+        }
+    }
+    if removed > 0 {
+        env.storage()
+            .persistent()
+            .set(&creator_fee_waiver_key(), &kept);
+    }
+    removed
+}
+
+/// Add or renew a waiver for `creator`. Shared by `add_fee_waiver` and `grant_fee_waiver`.
+fn grant_fee_waiver_internal(
+    env: &Env,
+    admin: &Address,
+    creator: &Address,
+    expires_at: u64,
+    reason: String,
+) {
+    assert!(
+        expires_at == 0 || expires_at > env.ledger().timestamp(),
+        "waiver expiry must be in the future"
+    );
+    // Free capacity held by lapsed waivers before enforcing the size cap.
+    purge_expired_fee_waivers_internal(env, admin);
+
+    let mut waivers = load_fee_waiver_list(env);
+    let already_listed = waivers.iter().any(|a| a == *creator);
+    if !already_listed {
+        assert!(
+            (waivers.len() as usize) < MAX_FEE_WAIVER_ENTRIES,
+            "fee waiver list full"
+        );
+        waivers.push_back(creator.clone());
+        env.storage()
+            .persistent()
+            .set(&creator_fee_waiver_key(), &waivers);
+    }
+
+    let waiver = FeeWaiver {
+        creator: creator.clone(),
+        granted_by: admin.clone(),
+        granted_at: env.ledger().timestamp(),
+        expires_at,
+        reason,
+    };
+    env.storage()
+        .persistent()
+        .set(&fee_waiver_record_key(creator), &waiver);
+    record_fee_waiver_audit(env, FeeWaiverAction::Granted, creator, admin, expires_at);
+    events::fee_waiver_granted(env, creator);
+    events::fee_waiver_expiry_set(env, creator, expires_at);
 }
 
 // ---------------------------------------------------------------------------
@@ -8105,17 +8649,29 @@ impl SplitContract {
     pub fn pool_pay(env: Env, payer: Address, payments: Vec<InvoicePayment>) {
         require_not_paused(&env);
         payer.require_auth();
+        Self::_pool_pay(&env, &payer, &payments, symbol_short!("pool_pay"));
+    }
 
+    /// Shared accounting for `pool_pay` and `execute_payment_batch` (issue #925).
+    /// Validates every payment, performs one token transfer and credits each
+    /// invoice; any failure panics so the whole call reverts. Returns the total
+    /// transferred. Callers are responsible for auth and pause checks.
+    fn _pool_pay(
+        env: &Env,
+        payer: &Address,
+        payments: &Vec<InvoicePayment>,
+        action: Symbol,
+    ) -> i128 {
         assert!(!payments.is_empty(), "payments must not be empty");
 
         // Determine the shared token from the first invoice.
-        let first_inv = load_invoice(&env, payments.get(0).unwrap().invoice_id);
+        let first_inv = load_invoice(env, payments.get(0).unwrap().invoice_id);
         let shared_token = funding_token_for(&first_inv);
 
         // Validate all payments and compute total.
         let mut total: i128 = 0;
         for p in payments.iter() {
-            let inv = load_invoice(&env, p.invoice_id);
+            let inv = load_invoice(env, p.invoice_id);
             assert!(
                 inv.status == InvoiceStatus::Pending,
                 "invoice is not pending"
@@ -8140,19 +8696,19 @@ impl SplitContract {
         }
 
         // Single token transfer from payer to contract.
-        let token_client = token::Client::new(&env, &shared_token);
-        token_client.transfer(&payer, &env.current_contract_address(), &total);
+        let token_client = token::Client::new(env, &shared_token);
+        token_client.transfer(payer, &env.current_contract_address(), &total);
 
         // Update each invoice via internal accounting (no further token transfers).
         for p in payments.iter() {
-            let mut inv = load_invoice(&env, p.invoice_id);
+            let mut inv = load_invoice(env, p.invoice_id);
             // Write payment to sharded storage (issue #177).
-            let shard_id = compute_shard_id(&env, &payer);
+            let shard_id = compute_shard_id(env, payer);
             let mut shard_payments: Vec<Payment> = env
                 .storage()
                 .persistent()
                 .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(p.invoice_id, shard_id))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
             shard_payments.push_back(Payment {
                 payer: payer.clone(),
                 amount: p.amount,
@@ -8173,8 +8729,8 @@ impl SplitContract {
                 .persistent()
                 .set(&cumulative_key, &(cumulative + p.amount));
 
-            append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
-            events::payment_received(&env, p.invoice_id, &payer, p.amount, &shared_token);
+            append_audit_entry(env, p.invoice_id, action.clone(), payer);
+            events::payment_received(env, p.invoice_id, payer, p.amount, &shared_token);
 
             let inv_total: i128 = inv.amounts.iter().sum();
             if inv.funded >= inv_total {
@@ -8194,14 +8750,247 @@ impl SplitContract {
                             < (inv.amounts.iter().sum::<i128>() * inv.min_funding_bps as i128
                                 / 10_000));
                 if guarded {
-                    save_invoice(&env, p.invoice_id, &inv);
+                    save_invoice(env, p.invoice_id, &inv);
                 } else {
-                    Self::_release(&env, p.invoice_id, &mut inv, &payer);
+                    Self::_release(env, p.invoice_id, &mut inv, payer);
                 }
             } else {
-                save_invoice(&env, p.invoice_id, &inv);
+                save_invoice(env, p.invoice_id, &inv);
             }
         }
+        total
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #925: Payment batching
+    // -----------------------------------------------------------------------
+
+    /// Open an empty payment batch for `payer` settling in `token`. Returns the batch id.
+    pub fn open_payment_batch(env: Env, payer: Address, token: Address) -> u64 {
+        require_not_paused(&env);
+        payer.require_auth();
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&payment_batch_next_id_key())
+            .unwrap_or(1);
+        env.storage()
+            .persistent()
+            .set(&payment_batch_next_id_key(), &(id + 1));
+        let batch = PaymentBatch {
+            id,
+            payer: payer.clone(),
+            token: token.clone(),
+            items: Vec::new(&env),
+            total: 0,
+            status: PaymentBatchStatus::Open,
+            created_at: env.ledger().timestamp(),
+            executed_at: 0,
+        };
+        env.storage().persistent().set(&payment_batch_key(id), &batch);
+        events::payment_batch_opened(&env, id, &payer, &token);
+        id
+    }
+
+    /// Add a payment toward `invoice_id` to an open batch.
+    ///
+    /// The invoice must be pending, not disputed, before its deadline and
+    /// funded in the batch token; the combined batched amount must not exceed
+    /// its remaining balance. Adding to an invoice already in the batch merges
+    /// the amounts. Panics with `BatchLimitExceeded` past the batch size limit.
+    pub fn add_to_payment_batch(
+        env: Env,
+        payer: Address,
+        batch_id: u64,
+        invoice_id: u64,
+        amount: i128,
+    ) {
+        require_not_paused(&env);
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        assert!(amount > 0, "payment amount must be positive");
+
+        let inv = load_invoice(&env, invoice_id);
+        assert!(inv.status == InvoiceStatus::Pending, "invoice is not pending");
+        assert!(!inv.disputed, "invoice is disputed");
+        assert!(
+            env.ledger().timestamp() <= inv.deadline,
+            "invoice deadline has passed"
+        );
+        assert!(
+            funding_token_for(&inv) == batch.token,
+            "all invoices must use the same token"
+        );
+
+        let mut existing: Option<u32> = None;
+        for (i, item) in batch.items.iter().enumerate() {
+            if item.invoice_id == invoice_id {
+                existing = Some(i as u32);
+            }
+        }
+        let batched_so_far = existing
+            .map(|i| batch.items.get(i).unwrap().amount)
+            .unwrap_or(0);
+        let new_amount = batched_so_far
+            .checked_add(amount)
+            .expect("payment amount overflow");
+        let inv_total: i128 = inv.amounts.iter().sum();
+        assert!(
+            inv.funded + new_amount <= inv_total,
+            "payment exceeds remaining balance"
+        );
+
+        match existing {
+            Some(i) => batch.items.set(
+                i,
+                InvoicePayment {
+                    invoice_id,
+                    amount: new_amount,
+                },
+            ),
+            None => {
+                if batch.items.len() >= payment_batch_limit(&env) {
+                    panic!("BatchLimitExceeded");
+                }
+                batch.items.push_back(InvoicePayment { invoice_id, amount });
+            }
+        }
+        batch.total = batch.total.checked_add(amount).expect("batch total overflow");
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+    }
+
+    /// Remove an invoice's payment from an open batch.
+    pub fn remove_from_payment_batch(env: Env, payer: Address, batch_id: u64, invoice_id: u64) {
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        let mut kept: Vec<InvoicePayment> = Vec::new(&env);
+        let mut total: i128 = 0;
+        for item in batch.items.iter() {
+            if item.invoice_id != invoice_id {
+                total += item.amount;
+                kept.push_back(item);
+            }
+        }
+        assert!(kept.len() < batch.items.len(), "invoice not in batch");
+        batch.items = kept;
+        batch.total = total;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+    }
+
+    /// Cancel an open batch. No funds have moved, so nothing is refunded.
+    pub fn cancel_payment_batch(env: Env, payer: Address, batch_id: u64) {
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        batch.status = PaymentBatchStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+        events::payment_batch_cancelled(&env, batch_id, &payer);
+    }
+
+    /// Settle every payment in the batch atomically with a single token transfer.
+    ///
+    /// All items are re-validated before any funds move; if any item is no
+    /// longer valid (e.g. the invoice was funded or expired meanwhile) the
+    /// whole call reverts and the batch stays open. Returns a cost comparison
+    /// against paying each invoice individually.
+    pub fn execute_payment_batch(env: Env, payer: Address, batch_id: u64) -> BatchExecutionReport {
+        require_fn_not_paused(&env, &symbol_short!("pay"));
+        require_not_frozen(&env);
+        payer.require_auth();
+        let mut batch = load_open_payment_batch(&env, batch_id, &payer);
+        assert!(!batch.items.is_empty(), "payments must not be empty");
+
+        // Estimate cost before execution, while recipient counts are still readable.
+        let item_count = batch.items.len();
+        let pay_op = symbol_short!("pay");
+        let mut unbatched_cpu_insns: u64 = 0;
+        let mut recipients_total: u32 = 0;
+        for item in batch.items.iter() {
+            let recipients = load_invoice(&env, item.invoice_id).recipients.len();
+            recipients_total = recipients_total.saturating_add(recipients);
+            unbatched_cpu_insns = unbatched_cpu_insns.saturating_add(
+                compute_cost_estimate(&env, &pay_op, recipients, 0, 0).cpu_insns,
+            );
+        }
+        let batched_cpu_insns = compute_cost_estimate(
+            &env,
+            &symbol_short!("batch_pay"),
+            recipients_total,
+            0,
+            item_count,
+        )
+        .cpu_insns;
+
+        batch.status = PaymentBatchStatus::Executed;
+        batch.executed_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&payment_batch_key(batch_id), &batch);
+
+        let total = Self::_pool_pay(&env, &payer, &batch.items, symbol_short!("batch_pay"));
+
+        let saved_insns = unbatched_cpu_insns.saturating_sub(batched_cpu_insns);
+        let savings_bps = if unbatched_cpu_insns == 0 {
+            0
+        } else {
+            ((saved_insns as u128) * 10_000 / (unbatched_cpu_insns as u128)) as u32
+        };
+        let report = BatchExecutionReport {
+            batch_id,
+            item_count,
+            total_amount: total,
+            token_transfers: 1,
+            transfers_saved: item_count - 1,
+            batched_cpu_insns,
+            unbatched_cpu_insns,
+            savings_bps,
+        };
+
+        let mut stats = load_batching_stats(&env);
+        stats.batches_executed += 1;
+        stats.items_processed += item_count as u64;
+        stats.total_volume = stats.total_volume.saturating_add(total);
+        stats.transfers_saved += (item_count - 1) as u64;
+        stats.estimated_insns_saved = stats.estimated_insns_saved.saturating_add(saved_insns);
+        stats.last_savings_bps = savings_bps;
+        env.storage()
+            .persistent()
+            .set(&payment_batch_stats_key(), &stats);
+
+        events::payment_batch_executed(&env, batch_id, &payer, item_count, total, savings_bps);
+        report
+    }
+
+    /// Set the maximum invoices per batch (1..=50). SuperAdmin only.
+    pub fn set_payment_batch_limit(env: Env, admin: Address, limit: u32) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            limit > 0 && limit <= MAX_PAYMENT_BATCH_LIMIT,
+            "batch limit out of range"
+        );
+        env.storage()
+            .persistent()
+            .set(&payment_batch_limit_key(), &limit);
+    }
+
+    /// Returns the maximum invoices per batch.
+    pub fn get_payment_batch_limit(env: Env) -> u32 {
+        payment_batch_limit(&env)
+    }
+
+    /// Returns a payment batch by id. Panics with "batch not found" if absent.
+    pub fn get_payment_batch(env: Env, batch_id: u64) -> PaymentBatch {
+        load_payment_batch(&env, batch_id)
+    }
+
+    /// Returns cumulative batching metrics.
+    pub fn get_batching_stats(env: Env) -> BatchingStats {
+        load_batching_stats(&env)
     }
 
     // -----------------------------------------------------------------------
@@ -9733,14 +10522,8 @@ impl SplitContract {
 
         let funding_token_client = token::Client::new(env, &funding_token_for(invoice));
 
-        let creator_waived: bool = {
-            let cfw: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&creator_fee_waiver_key())
-                .unwrap_or_else(|| Vec::new(env));
-            cfw.iter().any(|a| a == invoice.creator)
-        };
+        // Issue #922: expired waivers no longer exempt the creator.
+        let creator_waived: bool = creator_has_active_fee_waiver(env, &invoice.creator);
 
         let total: i128 = invoice.amounts.iter().sum();
         let funded = invoice.funded;
@@ -10286,14 +11069,8 @@ impl SplitContract {
         let funding_token_client = token::Client::new(env, &funding_token_for(invoice));
 
         // Issue #296: if creator has a fee waiver, platform_fee_bps is 0 for this invoice.
-        let creator_waived: bool = {
-            let cfw: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&creator_fee_waiver_key())
-                .unwrap_or_else(|| Vec::new(env));
-            cfw.iter().any(|a| a == invoice.creator)
-        };
+        // Issue #922: expired waivers no longer exempt the creator.
+        let creator_waived: bool = creator_has_active_fee_waiver(env, &invoice.creator);
 
         let funded = invoice.funded;
 
@@ -13907,81 +14684,434 @@ impl SplitContract {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #297: Contract-wide circuit breaker
+    // Issue #924: Runtime compute cost estimation, tracking and profiling
     // -----------------------------------------------------------------------
 
-    /// Activate the circuit breaker. Admin-only. Halts all mutating entry points.
-    pub fn activate_circuit_breaker(env: Env, admin: Address, reason: String) {
+    /// Estimate the cost of `operation` (`create`, `pay`, `release`, `refund`,
+    /// `batch_pay`, or any operation with an admin-defined model).
+    ///
+    /// The raw model estimate is scaled by the calibration learned from
+    /// `record_compute_usage`. Results are cached in temporary storage and
+    /// invalidated whenever a model or calibration changes.
+    pub fn estimate_operation_cost(
+        env: Env,
+        operation: Symbol,
+        recipient_count: u32,
+        payer_count: u32,
+        item_count: u32,
+    ) -> CostEstimate {
+        let key = cost_cache_key(&operation, recipient_count, payer_count, item_count);
+        let version = cost_model_version(&env);
+        if let Some(mut cached) = env.storage().temporary().get::<_, CostEstimate>(&key) {
+            if cached.model_version == version {
+                cached.cached = true;
+                return cached;
+            }
+        }
+        let estimate =
+            compute_cost_estimate(&env, &operation, recipient_count, payer_count, item_count);
+        env.storage().temporary().set(&key, &estimate);
+        estimate
+    }
+
+    /// Report the measured instruction count of an executed operation. Operator+ only.
+    ///
+    /// Updates the operation's profile (min / max / last / totals), scores the
+    /// current calibrated estimate against the measurement, and refreshes the
+    /// calibration used by future estimates.
+    pub fn record_compute_usage(
+        env: Env,
+        reporter: Address,
+        operation: Symbol,
+        recipient_count: u32,
+        payer_count: u32,
+        item_count: u32,
+        actual_insns: u64,
+    ) -> OperationProfile {
+        require_admin_role(&env, &reporter, AdminRole::Operator);
+        assert!(actual_insns > 0, "actual instructions must be positive");
+
+        let estimate =
+            compute_cost_estimate(&env, &operation, recipient_count, payer_count, item_count);
+        let error = estimate.cpu_insns.abs_diff(actual_insns);
+        let error_bps = ((error as u128) * 10_000 / (actual_insns as u128)).min(u32::MAX as u128)
+            as u32;
+
+        let mut profile = load_operation_profile(&env, &operation).unwrap_or(OperationProfile {
+            operation: operation.clone(),
+            samples: 0,
+            total_raw_estimated_insns: 0,
+            total_actual_insns: 0,
+            min_actual_insns: u64::MAX,
+            max_actual_insns: 0,
+            last_actual_insns: 0,
+            last_error_bps: 0,
+            within_tolerance: 0,
+        });
+        if profile.samples == 0 {
+            let mut ops: Vec<Symbol> = env
+                .storage()
+                .persistent()
+                .get(&cost_profiled_ops_key())
+                .unwrap_or_else(|| Vec::new(&env));
+            if !ops.iter().any(|o| o == operation) {
+                assert!(ops.len() < MAX_PROFILED_OPERATIONS, "too many profiled operations");
+                ops.push_back(operation.clone());
+                env.storage().persistent().set(&cost_profiled_ops_key(), &ops);
+            }
+        }
+        profile.samples = profile.samples.saturating_add(1);
+        profile.total_raw_estimated_insns = profile
+            .total_raw_estimated_insns
+            .saturating_add(estimate.raw_cpu_insns);
+        profile.total_actual_insns = profile.total_actual_insns.saturating_add(actual_insns);
+        profile.min_actual_insns = profile.min_actual_insns.min(actual_insns);
+        profile.max_actual_insns = profile.max_actual_insns.max(actual_insns);
+        profile.last_actual_insns = actual_insns;
+        profile.last_error_bps = error_bps;
+        if (error_bps as u64) <= COST_ESTIMATE_TOLERANCE_BPS {
+            profile.within_tolerance = profile.within_tolerance.saturating_add(1);
+        }
+        env.storage()
+            .persistent()
+            .set(&cost_profile_key(&operation), &profile);
+        bump_cost_model_version(&env);
+
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("cost_rec"), operation),
+            (actual_insns, estimate.cpu_insns, error_bps),
+        );
+        profile
+    }
+
+    /// Override the cost model for an operation (or define a new one). SuperAdmin only.
+    /// Invalidates every cached estimate.
+    pub fn set_operation_cost_model(
+        env: Env,
+        admin: Address,
+        operation: Symbol,
+        model: OperationCostModel,
+    ) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
         env.storage()
             .persistent()
-            .set(&circuit_breaker_key(), &true);
+            .set(&cost_model_key(&operation), &model);
+        bump_cost_model_version(&env);
+    }
+
+    /// Returns the cost model in effect for an operation. Panics on unknown operations.
+    pub fn get_operation_cost_model(env: Env, operation: Symbol) -> OperationCostModel {
+        load_cost_model(&env, &operation)
+    }
+
+    /// Returns the profiling data for an operation, if any usage has been recorded.
+    pub fn get_operation_profile(env: Env, operation: Symbol) -> Option<OperationProfile> {
+        load_operation_profile(&env, &operation)
+    }
+
+    /// Clear the profiling data (and so the calibration) of an operation. SuperAdmin only.
+    pub fn reset_operation_profile(env: Env, admin: Address, operation: Symbol) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
         env.storage()
             .persistent()
-            .set(&circuit_breaker_reason_key(), &reason.clone());
+            .remove(&cost_profile_key(&operation));
+        let ops: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&cost_profiled_ops_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut kept: Vec<Symbol> = Vec::new(&env);
+        for o in ops.iter() {
+            if o != operation {
+                kept.push_back(o);
+            }
+        }
+        env.storage().persistent().set(&cost_profiled_ops_key(), &kept);
+        bump_cost_model_version(&env);
+    }
+
+    /// Summarise profiling data for every tracked operation.
+    pub fn get_compute_cost_report(env: Env) -> Vec<OperationCostReport> {
+        let ops: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&cost_profiled_ops_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut report: Vec<OperationCostReport> = Vec::new(&env);
+        for operation in ops.iter() {
+            let profile = load_operation_profile(&env, &operation);
+            if let Some(p) = profile.clone() {
+                if p.samples == 0 {
+                    continue;
+                }
+                let samples = p.samples as u64;
+                report.push_back(OperationCostReport {
+                    operation: operation.clone(),
+                    samples: p.samples,
+                    avg_actual_insns: p.total_actual_insns / samples,
+                    avg_raw_estimated_insns: p.total_raw_estimated_insns / samples,
+                    min_actual_insns: p.min_actual_insns,
+                    max_actual_insns: p.max_actual_insns,
+                    calibration_bps: cost_calibration_bps(&profile),
+                    accuracy_bps: ((p.within_tolerance as u64) * 10_000 / samples) as u32,
+                });
+            }
+        }
+        report
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #297 / #923: Contract-wide circuit breaker
+    // -----------------------------------------------------------------------
+
+    /// Open the circuit breaker. Admin-only. Halts all guarded mutating entry
+    /// points except those on the exemption list. Valid from any state;
+    /// calling it while already open updates the reason.
+    pub fn activate_circuit_breaker(env: Env, admin: Address, reason: String) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        transition_circuit_breaker(&env, CircuitBreakerState::Open, &admin, &reason);
         events::circuit_breaker_activated(&env, &reason);
     }
 
-    /// Deactivate the circuit breaker. Admin-only.
+    /// Close the circuit breaker immediately, skipping recovery probation.
+    /// Admin-only emergency override; valid from any state.
     pub fn deactivate_circuit_breaker(env: Env, admin: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        env.storage()
-            .persistent()
-            .set(&circuit_breaker_key(), &false);
-        env.storage()
-            .persistent()
-            .remove(&circuit_breaker_reason_key());
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::Closed,
+            &admin,
+            &String::from_str(&env, "manual deactivation"),
+        );
         events::circuit_breaker_deactivated(&env);
+    }
+
+    /// Issue #923: Start recovery (Open -> HalfOpen). Admin-only.
+    /// Operations resume, but any failure reported during probation re-opens the breaker.
+    pub fn begin_circuit_recovery(env: Env, admin: Address) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            load_circuit_breaker_state(&env) == CircuitBreakerState::Open,
+            "invalid circuit breaker transition"
+        );
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::HalfOpen,
+            &admin,
+            &String::from_str(&env, "recovery started"),
+        );
+    }
+
+    /// Issue #923: Finish recovery (HalfOpen -> Closed) once the configured
+    /// probation period has elapsed. Admin-only.
+    pub fn complete_circuit_recovery(env: Env, admin: Address) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            load_circuit_breaker_state(&env) == CircuitBreakerState::HalfOpen,
+            "invalid circuit breaker transition"
+        );
+        let started: u32 = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_recovery_key())
+            .unwrap_or(0);
+        let config = load_circuit_breaker_config(&env);
+        assert!(
+            env.ledger().sequence() >= started.saturating_add(config.recovery_ledgers),
+            "recovery period not elapsed"
+        );
+        transition_circuit_breaker(
+            &env,
+            CircuitBreakerState::Closed,
+            &admin,
+            &String::from_str(&env, "recovery complete"),
+        );
+        events::circuit_breaker_deactivated(&env);
+    }
+
+    /// Issue #923: Report an operational failure or anomaly. Operator+ only.
+    ///
+    /// Activation conditions:
+    /// - `Closed`: the breaker opens once `failure_threshold` failures are
+    ///   reported within `failure_window_ledgers` (a threshold of 0 disables this).
+    /// - `HalfOpen`: a single failure re-opens the breaker.
+    /// - `Open`: the report is logged only.
+    ///
+    /// Returns the breaker state after the report.
+    pub fn report_circuit_failure(
+        env: Env,
+        reporter: Address,
+        reason: String,
+    ) -> CircuitBreakerState {
+        require_admin_role(&env, &reporter, AdminRole::Operator);
+        let state = load_circuit_breaker_state(&env);
+        let config = load_circuit_breaker_config(&env);
+        let ledger = env.ledger().sequence();
+
+        let (mut count, mut window_start): (u32, u32) = env
+            .storage()
+            .persistent()
+            .get(&circuit_breaker_failures_key())
+            .unwrap_or((0, ledger));
+        if ledger.saturating_sub(window_start) >= config.failure_window_ledgers {
+            count = 0;
+            window_start = ledger;
+        }
+        count = count.saturating_add(1);
+        events::circuit_breaker_failure_reported(&env, &reporter, count, config.failure_threshold);
+
+        let should_trip = match state {
+            CircuitBreakerState::Open => false,
+            CircuitBreakerState::HalfOpen => true,
+            CircuitBreakerState::Closed => {
+                config.failure_threshold > 0 && count >= config.failure_threshold
+            }
+        };
+        if should_trip {
+            transition_circuit_breaker(&env, CircuitBreakerState::Open, &reporter, &reason);
+            events::circuit_breaker_activated(&env, &reason);
+            return CircuitBreakerState::Open;
+        }
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_failures_key(), &(count, window_start));
+        state
+    }
+
+    /// Issue #923: Configure activation and recovery parameters. Admin-only.
+    pub fn set_circuit_breaker_config(env: Env, admin: Address, config: CircuitBreakerConfig) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(config.failure_window_ledgers > 0, "failure window must be positive");
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_config_key(), &config);
+    }
+
+    /// Issue #923: Returns the active circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig {
+        load_circuit_breaker_config(&env)
+    }
+
+    /// Issue #923: Allow (or stop allowing) a critical operation while the breaker is open.
+    /// `function` is the guard name the entry point checks, e.g. `refund`. Admin-only.
+    pub fn set_circuit_breaker_exemption(env: Env, admin: Address, function: Symbol, exempt: bool) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        let current = load_circuit_breaker_exemptions(&env);
+        let mut updated: Vec<Symbol> = Vec::new(&env);
+        for f in current.iter() {
+            if f != function {
+                updated.push_back(f);
+            }
+        }
+        if exempt {
+            updated.push_back(function.clone());
+        }
+        env.storage()
+            .persistent()
+            .set(&circuit_breaker_exempt_key(), &updated);
+        events::circuit_breaker_exemption_set(&env, &function, exempt);
+    }
+
+    /// Issue #923: Returns the operations exempt from the circuit breaker.
+    pub fn get_circuit_breaker_exemptions(env: Env) -> Vec<Symbol> {
+        load_circuit_breaker_exemptions(&env)
+    }
+
+    /// Issue #923: Returns recorded state transitions (oldest first, capped at 50).
+    pub fn get_circuit_breaker_history(env: Env) -> Vec<CircuitBreakerTransition> {
+        env.storage()
+            .persistent()
+            .get(&circuit_breaker_history_key())
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns the current circuit breaker status.
     /// Read-only — not affected by the circuit breaker.
     pub fn get_circuit_breaker_status(env: Env) -> CircuitBreakerStatus {
-        let active: bool = env
-            .storage()
-            .persistent()
-            .get(&circuit_breaker_key())
-            .unwrap_or(false);
-        let reason: Option<String> = env
-            .storage()
-            .persistent()
-            .get(&circuit_breaker_reason_key());
-        CircuitBreakerStatus { active, reason }
+        let storage = env.storage().persistent();
+        let active: bool = storage.get(&circuit_breaker_key()).unwrap_or(false);
+        let reason: Option<String> = storage.get(&circuit_breaker_reason_key());
+        let config = load_circuit_breaker_config(&env);
+        let failure_count = match storage.get::<_, (u32, u32)>(&circuit_breaker_failures_key()) {
+            Some((count, window_start))
+                if env.ledger().sequence().saturating_sub(window_start)
+                    < config.failure_window_ledgers =>
+            {
+                count
+            }
+            _ => 0,
+        };
+        CircuitBreakerStatus {
+            active,
+            reason,
+            state: load_circuit_breaker_state(&env),
+            opened_at_ledger: storage.get(&circuit_breaker_opened_key()).unwrap_or(0),
+            recovery_started_ledger: storage.get(&circuit_breaker_recovery_key()).unwrap_or(0),
+            failure_count,
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Issue #296: Per-creator fee waiver list
+    // Issue #296 / #922: Per-creator fee waiver whitelist
     // -----------------------------------------------------------------------
 
-    /// Grant a fee waiver to a creator. Admin-only. Max 100 entries.
+    /// Grant a non-expiring fee waiver to a creator. Admin-only. Max 100 entries.
+    /// Idempotent: re-adding a creator who already holds an active waiver is a no-op.
     pub fn add_fee_waiver(env: Env, admin: Address, creator: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        let mut waivers: Vec<Address> = env
+        if creator_has_active_fee_waiver(&env, &creator) {
+            return;
+        }
+        grant_fee_waiver_internal(&env, &admin, &creator, 0, String::from_str(&env, ""));
+    }
+
+    /// Issue #922: Grant (or renew) a fee waiver with an expiry and reason. Admin-only.
+    /// `expires_at` is a ledger timestamp; pass `0` for a waiver that never expires.
+    pub fn grant_fee_waiver(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        expires_at: u64,
+        reason: String,
+    ) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        grant_fee_waiver_internal(&env, &admin, &creator, expires_at, reason);
+    }
+
+    /// Issue #922: Change the expiry of an existing, still-active waiver. Admin-only.
+    pub fn extend_fee_waiver(env: Env, admin: Address, creator: Address, expires_at: u64) {
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            creator_has_active_fee_waiver(&env, &creator),
+            "no active fee waiver"
+        );
+        assert!(
+            expires_at == 0 || expires_at > env.ledger().timestamp(),
+            "waiver expiry must be in the future"
+        );
+        let mut waiver: FeeWaiver = env
             .storage()
             .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        assert!(
-            (waivers.len() as usize) < MAX_FEE_WAIVER_ENTRIES,
-            "fee waiver list full"
-        );
-        if !waivers.iter().any(|a| a == creator) {
-            waivers.push_back(creator.clone());
-            env.storage()
-                .persistent()
-                .set(&creator_fee_waiver_key(), &waivers);
-            events::fee_waiver_granted(&env, &creator);
-        }
+            .get(&fee_waiver_record_key(&creator))
+            .unwrap_or(FeeWaiver {
+                creator: creator.clone(),
+                granted_by: admin.clone(),
+                granted_at: env.ledger().timestamp(),
+                expires_at: 0,
+                reason: String::from_str(&env, ""),
+            });
+        waiver.expires_at = expires_at;
+        env.storage()
+            .persistent()
+            .set(&fee_waiver_record_key(&creator), &waiver);
+        record_fee_waiver_audit(&env, FeeWaiverAction::Extended, &creator, &admin, expires_at);
+        events::fee_waiver_expiry_set(&env, &creator, expires_at);
     }
 
     /// Revoke a fee waiver from a creator. Admin-only.
     pub fn remove_fee_waiver(env: Env, admin: Address, creator: Address) {
         require_admin_role(&env, &admin, AdminRole::SuperAdmin);
-        let waivers: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
+        let waivers = load_fee_waiver_list(&env);
         let mut new_waivers: Vec<Address> = Vec::new(&env);
         for a in waivers.iter() {
             if a != creator {
@@ -13991,17 +15121,59 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&creator_fee_waiver_key(), &new_waivers);
+        let expires_at = env
+            .storage()
+            .persistent()
+            .get::<_, FeeWaiver>(&fee_waiver_record_key(&creator))
+            .map(|w| w.expires_at)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .remove(&fee_waiver_record_key(&creator));
+        record_fee_waiver_audit(&env, FeeWaiverAction::Revoked, &creator, &admin, expires_at);
         events::fee_waiver_revoked(&env, &creator);
     }
 
-    /// Returns true if the creator is on the fee waiver list.
+    /// Issue #922: Remove all expired waivers from the whitelist. Callable by anyone.
+    /// Returns the number of waivers removed.
+    pub fn purge_expired_fee_waivers(env: Env, caller: Address) -> u32 {
+        caller.require_auth();
+        purge_expired_fee_waivers_internal(&env, &caller)
+    }
+
+    /// Returns true if the creator holds an active (unexpired) fee waiver.
     pub fn has_fee_waiver(env: Env, creator: Address) -> bool {
-        let waivers: Vec<Address> = env
-            .storage()
+        creator_has_active_fee_waiver(&env, &creator)
+    }
+
+    /// Issue #922: Returns the waiver record for a whitelisted creator, if any.
+    /// Expired waivers that have not yet been purged are still returned.
+    pub fn get_fee_waiver(env: Env, creator: Address) -> Option<FeeWaiver> {
+        if !load_fee_waiver_list(&env).iter().any(|a| a == creator) {
+            return None;
+        }
+        env.storage()
             .persistent()
-            .get(&creator_fee_waiver_key())
-            .unwrap_or_else(|| Vec::new(&env));
-        waivers.iter().any(|a| a == creator)
+            .get(&fee_waiver_record_key(&creator))
+    }
+
+    /// Issue #922: Returns all creators currently holding an active fee waiver.
+    pub fn list_fee_waivers(env: Env) -> Vec<Address> {
+        let mut active: Vec<Address> = Vec::new(&env);
+        for creator in load_fee_waiver_list(&env).iter() {
+            if creator_has_active_fee_waiver(&env, &creator) {
+                active.push_back(creator);
+            }
+        }
+        active
+    }
+
+    /// Issue #922: Returns the fee waiver audit log (most recent last, capped at 200).
+    pub fn get_fee_waiver_audit_log(env: Env) -> Vec<FeeWaiverAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&fee_waiver_audit_key())
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // -----------------------------------------------------------------------

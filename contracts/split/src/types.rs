@@ -1653,12 +1653,212 @@ pub struct ComputeEstimate {
     pub fee_stroops: i128,
 }
 
+/// Issue #925: Lifecycle of a payment batch.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaymentBatchStatus {
+    Open,
+    Executed,
+    Cancelled,
+}
+
+/// Issue #925: Payments collected for one payer, settled with a single token transfer.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentBatch {
+    pub id: u64,
+    pub payer: Address,
+    pub token: Address,
+    /// One entry per invoice; repeated additions to the same invoice are merged.
+    pub items: Vec<InvoicePayment>,
+    pub total: i128,
+    pub status: PaymentBatchStatus,
+    pub created_at: u64,
+    pub executed_at: u64,
+}
+
+/// Issue #925: Outcome and cost comparison of one executed batch.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchExecutionReport {
+    pub batch_id: u64,
+    pub item_count: u32,
+    pub total_amount: i128,
+    /// Token transfers performed (always 1) vs. one per item when paid individually.
+    pub token_transfers: u32,
+    pub transfers_saved: u32,
+    pub batched_cpu_insns: u64,
+    pub unbatched_cpu_insns: u64,
+    /// Estimated instruction savings vs. individual `pay` calls, in basis points.
+    pub savings_bps: u32,
+}
+
+/// Issue #925: Cumulative batching metrics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchingStats {
+    pub batches_executed: u64,
+    pub items_processed: u64,
+    pub total_volume: i128,
+    pub transfers_saved: u64,
+    pub estimated_insns_saved: u64,
+    pub last_savings_bps: u32,
+}
+
+/// Issue #924: Linear cost model for one operation.
+///
+/// `cpu = base_insns + recipients * per_recipient_insns + payers * per_payer_insns
+///        + items * per_item_insns`
+/// `mem = base_mem_bytes + (recipients + payers + items) * per_unit_mem_bytes`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostModel {
+    pub base_insns: u64,
+    pub per_recipient_insns: u64,
+    pub per_payer_insns: u64,
+    pub per_item_insns: u64,
+    pub base_mem_bytes: u64,
+    pub per_unit_mem_bytes: u64,
+}
+
+/// Issue #924: Result of `estimate_operation_cost`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostEstimate {
+    pub operation: Symbol,
+    /// Calibrated instruction estimate (raw estimate scaled by `calibration_bps`).
+    pub cpu_insns: u64,
+    /// Uncalibrated instruction estimate straight from the cost model.
+    pub raw_cpu_insns: u64,
+    pub mem_bytes: u64,
+    pub fee_stroops: i128,
+    /// Observed actual / raw estimate ratio in basis points (10_000 = model is exact).
+    pub calibration_bps: u32,
+    pub within_budget: bool,
+    /// True when served from the estimate cache.
+    pub cached: bool,
+    /// Cost model version the estimate was computed against.
+    pub model_version: u32,
+}
+
+/// Issue #924: Per-operation profiling data built from reported actual usage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationProfile {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub total_raw_estimated_insns: u64,
+    pub total_actual_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub last_actual_insns: u64,
+    /// Error of the calibrated estimate for the last sample, in basis points of actual.
+    pub last_error_bps: u32,
+    /// Samples whose calibrated estimate was within 10% of actual.
+    pub within_tolerance: u32,
+}
+
+/// Issue #924: One row of `get_compute_cost_report`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCostReport {
+    pub operation: Symbol,
+    pub samples: u32,
+    pub avg_actual_insns: u64,
+    pub avg_raw_estimated_insns: u64,
+    pub min_actual_insns: u64,
+    pub max_actual_insns: u64,
+    pub calibration_bps: u32,
+    /// Share of samples estimated within 10%, in basis points.
+    pub accuracy_bps: u32,
+}
+
 /// Issue #297: Circuit breaker status returned by get_circuit_breaker_status().
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct CircuitBreakerStatus {
     pub active: bool,
     pub reason: Option<String>,
+    /// Issue #923: current state machine position.
+    pub state: CircuitBreakerState,
+    /// Issue #923: ledger at which the breaker last opened (0 if never / closed).
+    pub opened_at_ledger: u32,
+    /// Issue #923: ledger at which recovery (HalfOpen) began (0 if not recovering).
+    pub recovery_started_ledger: u32,
+    /// Issue #923: failures reported in the current failure window.
+    pub failure_count: u32,
+}
+
+/// Issue #923: Circuit breaker state machine.
+///
+/// - `Closed`: normal operation.
+/// - `Open`: tripped; all guarded mutating operations fail except exempt ones.
+/// - `HalfOpen`: recovery probation; operations resume, but any reported
+///   failure re-opens the breaker immediately.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Issue #923: Activation and recovery parameters for the circuit breaker.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Failures within `failure_window_ledgers` that trip the breaker. `0` disables auto-trip.
+    pub failure_threshold: u32,
+    /// Length of the failure counting window, in ledgers.
+    pub failure_window_ledgers: u32,
+    /// Minimum ledgers the breaker must spend in `HalfOpen` before recovery can complete.
+    pub recovery_ledgers: u32,
+}
+
+/// Issue #923: A recorded circuit breaker state transition.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerTransition {
+    pub from: CircuitBreakerState,
+    pub to: CircuitBreakerState,
+    pub actor: Address,
+    pub reason: String,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+/// Issue #922: Fee waiver record for a whitelisted creator.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiver {
+    pub creator: Address,
+    pub granted_by: Address,
+    pub granted_at: u64,
+    /// Ledger timestamp at which the waiver lapses; `0` means it never expires.
+    pub expires_at: u64,
+    pub reason: String,
+}
+
+/// Issue #922: Action recorded in the fee waiver audit log.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeWaiverAction {
+    Granted,
+    Extended,
+    Revoked,
+    Expired,
+}
+
+/// Issue #922: A single fee waiver audit log entry.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeWaiverAuditEntry {
+    pub action: FeeWaiverAction,
+    pub creator: Address,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub ledger: u32,
+    pub expires_at: u64,
 }
 
 /// Issue #295: A single confidential payment record stored per payer.
