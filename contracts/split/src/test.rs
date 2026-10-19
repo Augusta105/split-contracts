@@ -8688,3 +8688,229 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #930 — webhook notification system
+// ---------------------------------------------------------------------------
+
+mod webhook_sinks {
+    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+    /// Subscriber that records the last delivery it received.
+    #[contract]
+    pub struct OkSink;
+    #[contractimpl]
+    impl OkSink {
+        pub fn on_webhook(env: Env, delivery_id: u64, invoice_id: u64, event: u32) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("last"), &(delivery_id, invoice_id, event));
+        }
+    }
+
+    /// Subscriber that always fails.
+    #[contract]
+    pub struct FailSink;
+    #[contractimpl]
+    impl FailSink {
+        pub fn on_webhook(_env: Env, _delivery_id: u64, _invoice_id: u64, _event: u32) {
+            panic!("sink unavailable");
+        }
+    }
+}
+
+fn endpoint(env: &Env) -> String {
+    String::from_str(env, "https://relayer.example/hooks/split")
+}
+
+#[test]
+fn test_930_register_and_list_webhook() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    let id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None);
+    let wh = c.get_webhook(&id).unwrap();
+    assert_eq!(wh.owner, owner);
+    assert_eq!(wh.event_mask, webhooks::EVENT_ALL);
+    assert!(wh.active);
+    assert_eq!(c.list_webhooks().len(), 1);
+    assert_eq!(c.list_owner_webhooks(&owner).len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "invalid webhook event mask")]
+fn test_930_register_rejects_empty_mask() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    c.register_webhook(&owner, &endpoint(&env), &None, &0u32, &None);
+}
+
+#[test]
+#[should_panic(expected = "webhook requires an endpoint or target")]
+fn test_930_register_rejects_missing_destination() {
+    let (env, contract_id, _token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    c.register_webhook(&owner, &String::from_str(&env, ""), &None, &webhooks::EVENT_ALL, &None);
+}
+
+#[test]
+fn test_930_endpoint_delivery_pending_until_acked() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_CREATED, &None);
+    let invoice_id = make_invoice(
+        &env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999,
+    );
+
+    let deliveries = c.list_webhook_deliveries(&wh_id);
+    assert_eq!(deliveries.len(), 1);
+    let d = deliveries.get(0).unwrap();
+    assert_eq!(d.invoice_id, invoice_id);
+    assert_eq!(d.event, webhooks::EVENT_CREATED);
+    assert_eq!(d.status, webhooks::DeliveryStatus::Pending);
+    assert_eq!(d.attempts, 1);
+    assert!(d.next_retry_ledger > d.last_attempt_ledger);
+
+    let status = c.ack_webhook_delivery(&owner, &d.id, &true);
+    assert_eq!(status, webhooks::DeliveryStatus::Delivered);
+    assert_eq!(c.get_webhook(&wh_id).unwrap().delivered_count, 1);
+}
+
+#[test]
+fn test_930_event_mask_filters_events() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_RELEASED, &None);
+    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+
+    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
+}
+
+#[test]
+fn test_930_invoice_scope_filters_other_invoices() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let creator = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let first = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+    let wh_id = c.register_webhook(
+        &owner, &endpoint(&env), &None, &webhooks::EVENT_CANCELLED, &Some(first),
+    );
+    let second = make_invoice(&env, &c, &creator, &Address::generate(&env), 100, &token_id, 9_999);
+
+    c.cancel_invoice(&creator, &second);
+    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
+
+    c.cancel_invoice(&creator, &first);
+    let deliveries = c.list_webhook_deliveries(&wh_id);
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries.get(0).unwrap().invoice_id, first);
+}
+
+#[test]
+fn test_930_target_contract_delivered_immediately() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let sink = env.register(webhook_sinks::OkSink, ());
+    env.ledger().set_timestamp(1_000);
+
+    let wh_id = c.register_webhook(
+        &owner, &String::from_str(&env, ""), &Some(sink), &webhooks::EVENT_CREATED, &None,
+    );
+    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+
+    let d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
+    assert_eq!(d.status, webhooks::DeliveryStatus::Delivered);
+    assert_eq!(d.next_retry_ledger, 0);
+}
+
+#[test]
+fn test_930_failing_target_retries_with_backoff_then_fails() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let sink = env.register(webhook_sinks::FailSink, ());
+    env.ledger().set_timestamp(1_000);
+    env.ledger().set_sequence_number(100);
+
+    let wh_id = c.register_webhook(
+        &owner, &String::from_str(&env, ""), &Some(sink), &webhooks::EVENT_CREATED, &None,
+    );
+    // Creating the invoice must succeed even though the subscriber fails.
+    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+
+    let mut d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
+    assert_eq!(d.status, webhooks::DeliveryStatus::Pending);
+    assert_eq!(d.next_retry_ledger, 100 + webhooks::backoff_ledgers(1));
+
+    // Backoff doubles on each failed attempt.
+    let mut prev_gap = webhooks::backoff_ledgers(1);
+    while d.status == webhooks::DeliveryStatus::Pending {
+        env.ledger().set_sequence_number(d.next_retry_ledger);
+        c.retry_webhook_delivery(&d.id);
+        d = c.get_webhook_delivery(&d.id).unwrap();
+        if d.status == webhooks::DeliveryStatus::Pending {
+            let gap = d.next_retry_ledger - d.last_attempt_ledger;
+            assert!(gap >= prev_gap);
+            prev_gap = gap;
+        }
+    }
+
+    assert_eq!(d.status, webhooks::DeliveryStatus::Failed);
+    assert_eq!(d.attempts, webhooks::MAX_DELIVERY_ATTEMPTS);
+    assert_eq!(c.get_webhook(&wh_id).unwrap().failed_count, 1);
+}
+
+#[test]
+#[should_panic(expected = "retry not yet due")]
+fn test_930_retry_before_backoff_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_CREATED, &None);
+    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+    let d = c.list_webhook_deliveries(&wh_id).get(0).unwrap();
+    c.retry_webhook_delivery(&d.id);
+}
+
+#[test]
+fn test_930_update_and_remove_webhook() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let owner = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let wh_id = c.register_webhook(&owner, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None);
+    c.update_webhook(&owner, &wh_id, &endpoint(&env), &None, &webhooks::EVENT_ALL, &None, &false);
+    assert!(!c.get_webhook(&wh_id).unwrap().active);
+
+    // Inactive webhooks receive nothing.
+    make_invoice(&env, &c, &Address::generate(&env), &Address::generate(&env), 100, &token_id, 9_999);
+    assert_eq!(c.list_webhook_deliveries(&wh_id).len(), 0);
+
+    c.remove_webhook(&owner, &wh_id);
+    assert!(c.get_webhook(&wh_id).is_none());
+    assert_eq!(c.list_webhooks().len(), 0);
+}
+
+#[test]
+fn test_930_backoff_is_exponential_and_capped() {
+    assert_eq!(webhooks::backoff_ledgers(1), webhooks::RETRY_BASE_LEDGERS);
+    assert_eq!(webhooks::backoff_ledgers(2), webhooks::RETRY_BASE_LEDGERS * 2);
+    assert_eq!(webhooks::backoff_ledgers(3), webhooks::RETRY_BASE_LEDGERS * 4);
+    assert_eq!(webhooks::backoff_ledgers(100), webhooks::RETRY_MAX_BACKOFF_LEDGERS);
+}

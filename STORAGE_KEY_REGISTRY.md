@@ -179,6 +179,20 @@ pub fn upgrade(env: Env) {
 }
 ```
 
+## Webhook Storage: `WebhookKey` enum (Issue #930)
+
+Defined privately in `contracts/split/src/webhooks.rs` so the webhook subsystem owns its keys and cannot collide with the four registry enums.
+
+| Variant | Tier | Value | Purpose |
+|---------|------|-------|---------|
+| `NextWebhookId` | instance | `u64` | Next webhook id |
+| `NextDeliveryId` | instance | `u64` | Next delivery id |
+| `WebhookIds` | instance | `Vec<u64>` | Ids of all registered webhooks (≤ `MAX_WEBHOOKS`) |
+| `Webhook(u64)` | persistent | `Webhook` | Webhook subscription record |
+| `OwnerWebhooks(Address)` | persistent | `Vec<u64>` | Webhook ids owned by an address |
+| `Delivery(u64)` | persistent | `WebhookDelivery` | Delivery status record |
+| `WebhookDeliveries(u64)` | persistent | `Vec<u64>` | Most recent delivery ids per webhook (≤ 50) |
+
 ## Uniqueness Validation
 
 Unit tests in `storage_keys.rs` verify that:
